@@ -51,7 +51,9 @@ llvm_config.with_environment("OCAMLPATH", top_ocaml_lib, append_path=True)
 llvm_config.with_environment("OCAMLPATH", llvm_ocaml_lib, append_path=True)
 
 llvm_config.with_system_environment("CAML_LD_LIBRARY_PATH")
-llvm_config.with_environment("CAML_LD_LIBRARY_PATH", llvm_ocaml_lib, append_path=True)
+llvm_config.with_environment(
+    "CAML_LD_LIBRARY_PATH", llvm_ocaml_lib, append_path=True
+)
 
 # Set up OCAMLRUNPARAM to enable backtraces in OCaml tests.
 llvm_config.with_environment("OCAMLRUNPARAM", "b")
@@ -143,13 +145,17 @@ llvm_original_di_preservation_cmd = os.path.join(
 config.substitutions.append(
     (
         "%llvm-original-di-preservation",
-        "'%s' %s" % (config.python_executable, llvm_original_di_preservation_cmd),
+        "'%s' %s"
+        % (config.python_executable, llvm_original_di_preservation_cmd),
     )
 )
 
 llvm_locstats_tool = os.path.join(config.llvm_tools_dir, "llvm-locstats")
 config.substitutions.append(
-    ("%llvm-locstats", "'%s' %s" % (config.python_executable, llvm_locstats_tool))
+    (
+        "%llvm-locstats",
+        "'%s' %s" % (config.python_executable, llvm_locstats_tool),
+    )
 )
 config.llvm_locstats_used = os.path.exists(llvm_locstats_tool)
 
@@ -267,6 +273,7 @@ tools.extend(
     ]
 )
 
+
 # Find (major, minor) version of ptxas
 def ptxas_version(ptxas):
     ptxas_cmd = subprocess.Popen([ptxas, "--version"], stdout=subprocess.PIPE)
@@ -325,13 +332,17 @@ def enable_ptxas(ptxas_executable):
         for known_version in ptxas_known_versions:
             if version_int(known_version) <= version_int(version):
                 major, minor = known_version
-                config.available_features.add("ptxas-{}.{}".format(major, minor))
+                config.available_features.add(
+                    "ptxas-{}.{}".format(major, minor)
+                )
 
     config.available_features.add("ptxas")
     tools.extend(
         [
             ToolSubst("%ptxas", ptxas_executable),
-            ToolSubst("%ptxas-verify", "{} -arch=sm_60 -c -".format(ptxas_executable)),
+            ToolSubst(
+                "%ptxas-verify", "{} -arch=sm_60 -c -".format(ptxas_executable)
+            ),
         ]
     )
 
@@ -383,7 +394,9 @@ else:
     config.substitutions.append(
         (
             "%loadbye",
-            "-load={}/Bye{}".format(config.llvm_shlib_dir, config.llvm_shlib_ext),
+            "-load={}/Bye{}".format(
+                config.llvm_shlib_dir, config.llvm_shlib_ext
+            ),
         )
     )
     config.substitutions.append(
@@ -418,8 +431,10 @@ if config.link_llvm_dylib:
             # libLLVM.so.19.0git
             "%llvmdylib",
             "{}/libLLVM{}.{}".format(
-                config.llvm_shlib_dir, config.llvm_shlib_ext, config.llvm_dylib_version
-            )
+                config.llvm_shlib_dir,
+                config.llvm_shlib_ext,
+                config.llvm_dylib_version,
+            ),
         )
     )
 
@@ -492,7 +507,9 @@ def have_ld_plugin_support():
         return False
 
     ld_cmd = subprocess.Popen(
-        [config.gold_executable, "--help"], stdout=subprocess.PIPE, env={"LANG": "C"}
+        [config.gold_executable, "--help"],
+        stdout=subprocess.PIPE,
+        env={"LANG": "C"},
     )
     ld_out = ld_cmd.stdout.read().decode()
     ld_cmd.wait()
@@ -515,7 +532,9 @@ def have_ld_plugin_support():
         config.available_features.add("ld_emu_elf32ppc")
 
     ld_version = subprocess.Popen(
-        [config.gold_executable, "--version"], stdout=subprocess.PIPE, env={"LANG": "C"}
+        [config.gold_executable, "--version"],
+        stdout=subprocess.PIPE,
+        env={"LANG": "C"},
     )
     if not "GNU gold" in ld_version.stdout.read().decode():
         return False
@@ -537,7 +556,9 @@ def have_ld64_plugin_support():
     if config.ld64_executable == "":
         return False
 
-    ld_cmd = subprocess.Popen([config.ld64_executable, "-v"], stderr=subprocess.PIPE)
+    ld_cmd = subprocess.Popen(
+        [config.ld64_executable, "-v"], stderr=subprocess.PIPE
+    )
     ld_out = ld_cmd.stderr.read().decode()
     ld_cmd.wait()
 
@@ -574,7 +595,10 @@ if "darwin" == sys.platform:
         if "hw.optional.fma: 1" in result:
             config.available_features.add("fma3")
 
-if not hasattr(sys, "getwindowsversion") or sys.getwindowsversion().build >= 17063:
+if (
+    not hasattr(sys, "getwindowsversion")
+    or sys.getwindowsversion().build >= 17063
+):
     config.available_features.add("unix-sockets")
 
 # .debug_frame is not emitted for targeting Windows x64, aarch64/arm64, AIX, or Apple Silicon Mac.

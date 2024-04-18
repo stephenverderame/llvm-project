@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines the RABasic function pass, which provides a minimal
+// This file defines the RAParallel function pass, which provides a minimal
 // implementation of the basic register allocator.
 //
 //===----------------------------------------------------------------------===//
@@ -37,8 +37,9 @@ using namespace llvm;
 
 #define DEBUG_TYPE "regalloc"
 
-static RegisterRegAlloc basicRegAlloc("basic", "basic register allocator",
-                                      createBasicRegisterAllocator);
+static RegisterRegAlloc ParallelRegAlloc("parallel",
+                                         "parallel register allocator",
+                                         createParallelRegisterAllocator);
 
 namespace {
 struct CompSpillWeight {
@@ -49,14 +50,15 @@ struct CompSpillWeight {
 } // namespace
 
 namespace {
-/// RABasic provides a minimal implementation of the basic register allocation
-/// algorithm. It prioritizes live virtual registers by spill weight and spills
-/// whenever a register is unavailable. This is not practical in production but
-/// provides a useful baseline both for measuring other allocators and comparing
-/// the speed of the basic algorithm against other styles of allocators.
-class RABasic : public MachineFunctionPass,
-                public RegAllocBase,
-                private LiveRangeEdit::Delegate {
+/// RAParallel provides a minimal implementation of the basic register
+/// allocation algorithm. It prioritizes live virtual registers by spill weight
+/// and spills whenever a register is unavailable. This is not practical in
+/// production but provides a useful baseline both for measuring other
+/// allocators and comparing the speed of the basic algorithm against other
+/// styles of allocators.
+class RAParallel : public MachineFunctionPass,
+                   public RegAllocBase,
+                   private LiveRangeEdit::Delegate {
   // context
   MachineFunction *MF = nullptr;
 
@@ -74,12 +76,14 @@ class RABasic : public MachineFunctionPass,
   void LRE_WillShrinkVirtReg(Register) override;
 
 public:
-  RABasic(const RegClassFilterFunc F = allocateAllRegClasses);
+  RAParallel(const RegClassFilterFunc F = allocateAllRegClasses);
 
   /// Return the pass name.
-  StringRef getPassName() const override { return "Basic Register Allocator"; }
+  StringRef getPassName() const override {
+    return "Parallel Register Allocator";
+  }
 
-  /// RABasic analysis usage.
+  /// RAParallel analysis usage.
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
   void releaseMemory() override;
@@ -100,7 +104,7 @@ public:
                            SmallVectorImpl<Register> &SplitVRegs) override;
 
   /// Perform register allocation.
-  bool runOnMachineFunction(MachineFunction &mf) override;
+  bool runOnMachineFunction(MachineFunction &Mf) override;
 
   MachineFunctionProperties getRequiredProperties() const override {
     return MachineFunctionProperties().set(
@@ -121,14 +125,14 @@ public:
   static char ID;
 };
 
-char RABasic::ID = 0;
+char RAParallel::ID = 0;
 
 } // end anonymous namespace
 
-char &llvm::RABasicID = RABasic::ID;
+char &llvm::RAParallelID = RAParallel::ID;
 
-INITIALIZE_PASS_BEGIN(RABasic, "regallocbasic", "Basic Register Allocator",
-                      false, false)
+INITIALIZE_PASS_BEGIN(RAParallel, "regallocparallel",
+                      "Parallel Register Allocator", false, false)
 INITIALIZE_PASS_DEPENDENCY(LiveDebugVariables)
 INITIALIZE_PASS_DEPENDENCY(SlotIndexes)
 INITIALIZE_PASS_DEPENDENCY(LiveIntervals)
@@ -140,10 +144,10 @@ INITIALIZE_PASS_DEPENDENCY(MachineDominatorTree)
 INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
 INITIALIZE_PASS_DEPENDENCY(VirtRegMap)
 INITIALIZE_PASS_DEPENDENCY(LiveRegMatrix)
-INITIALIZE_PASS_END(RABasic, "regallocbasic", "Basic Register Allocator", false,
-                    false)
+INITIALIZE_PASS_END(RAParallel, "regallocparallel",
+                    "Parallel Register Allocator", false, false)
 
-bool RABasic::LRE_CanEraseVirtReg(Register VirtReg) {
+bool RAParallel::LRE_CanEraseVirtReg(Register VirtReg) {
   LiveInterval &LI = LIS->getInterval(VirtReg);
   if (VRM->hasPhys(VirtReg)) {
     Matrix->unassign(LI);
@@ -158,7 +162,7 @@ bool RABasic::LRE_CanEraseVirtReg(Register VirtReg) {
   return false;
 }
 
-void RABasic::LRE_WillShrinkVirtReg(Register VirtReg) {
+void RAParallel::LRE_WillShrinkVirtReg(Register VirtReg) {
   if (!VRM->hasPhys(VirtReg))
     return;
 
@@ -168,10 +172,10 @@ void RABasic::LRE_WillShrinkVirtReg(Register VirtReg) {
   enqueue(&LI);
 }
 
-RABasic::RABasic(RegClassFilterFunc F)
+RAParallel::RAParallel(RegClassFilterFunc F)
     : MachineFunctionPass(ID), RegAllocBase(F) {}
 
-void RABasic::getAnalysisUsage(AnalysisUsage &AU) const {
+void RAParallel::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesCFG();
   AU.addRequired<AAResultsWrapperPass>();
   AU.addPreserved<AAResultsWrapperPass>();
@@ -195,14 +199,14 @@ void RABasic::getAnalysisUsage(AnalysisUsage &AU) const {
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
-void RABasic::releaseMemory() { SpillerInstance.reset(); }
+void RAParallel::releaseMemory() { SpillerInstance.reset(); }
 
 // Spill or split all live virtual registers currently unified under PhysReg
 // that interfere with VirtReg. The newly spilled or split live intervals are
 // returned by appending them to SplitVRegs.
-bool RABasic::spillInterferences(const LiveInterval &VirtReg,
-                                 MCRegister PhysReg,
-                                 SmallVectorImpl<Register> &SplitVRegs) {
+bool RAParallel::spillInterferences(const LiveInterval &VirtReg,
+                                    MCRegister PhysReg,
+                                    SmallVectorImpl<Register> &SplitVRegs) {
   // Record each interference and determine if all are spillable before mutating
   // either the union or live intervals.
   SmallVector<const LiveInterval *, 8> Intfs;
@@ -221,6 +225,7 @@ bool RABasic::spillInterferences(const LiveInterval &VirtReg,
   assert(!Intfs.empty() && "expected interference");
 
   // Spill each interfering vreg allocated to PhysReg or an alias.
+  // NOLINTNEXTLINE(readability-identifier-naming)
   for (unsigned i = 0, e = Intfs.size(); i != e; ++i) {
     const LiveInterval &Spill = *Intfs[i];
 
@@ -251,8 +256,8 @@ bool RABasic::spillInterferences(const LiveInterval &VirtReg,
 // |vregs| * |machineregs|. And since the number of interference tests is
 // minimal, there is no value in caching them outside the scope of
 // selectOrSplit().
-MCRegister RABasic::selectOrSplit(const LiveInterval &VirtReg,
-                                  SmallVectorImpl<Register> &SplitVRegs) {
+MCRegister RAParallel::selectOrSplit(const LiveInterval &VirtReg,
+                                     SmallVectorImpl<Register> &SplitVRegs) {
   // Populate a list of physical register spill candidates.
   SmallVector<MCRegister, 8> PhysRegSpillCands;
 
@@ -301,11 +306,11 @@ MCRegister RABasic::selectOrSplit(const LiveInterval &VirtReg,
   return 0;
 }
 
-bool RABasic::runOnMachineFunction(MachineFunction &mf) {
-  LLVM_DEBUG(dbgs() << "********** BASIC REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << mf.getName() << '\n');
+bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
+  LLVM_DEBUG(dbgs() << "********** Parallel REGISTER ALLOCATION **********\n"
+                    << "********** Function: " << Mf.getName() << '\n');
 
-  MF = &mf;
+  MF = &Mf;
   RegAllocBase::init(getAnalysis<VirtRegMap>(), getAnalysis<LiveIntervals>(),
                      getAnalysis<LiveRegMatrix>());
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, getAnalysis<MachineLoopInfo>(),
@@ -324,8 +329,10 @@ bool RABasic::runOnMachineFunction(MachineFunction &mf) {
   return true;
 }
 
-FunctionPass *llvm::createBasicRegisterAllocator() { return new RABasic(); }
+FunctionPass *llvm::createParallelRegisterAllocator() {
+  return new RAParallel();
+}
 
-FunctionPass *llvm::createBasicRegisterAllocator(RegClassFilterFunc F) {
-  return new RABasic(F);
+FunctionPass *llvm::createParallelRegisterAllocator(RegClassFilterFunc F) {
+  return new RAParallel(F);
 }
