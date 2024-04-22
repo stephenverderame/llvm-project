@@ -14,24 +14,32 @@
 #include "AllocationOrder.h"
 #include "LiveDebugVariables.h"
 #include "RegAllocBase.h"
+#include "llvm/ADT/DirectedGraph.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
 #include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/LiveStacks.h"
+#include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
+#include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/Spiller.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <initializer_list>
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -50,6 +58,17 @@ struct CompSpillWeight {
 } // namespace
 
 namespace {
+using IGraph = std::map<Register, std::set<Register>>;
+
+/// A partition tree is a binary tree that represents a partition of a set of
+/// registers. Each leaf node contains a set of registers, and each internal
+/// node contains two children and no registers.
+struct PartitionTree {
+  /// Invariant: Either has both children and no regs or is a leaf and has regs.
+  std::unique_ptr<PartitionTree> Left, Right;
+  std::vector<Register> Regs;
+};
+
 /// RAParallel provides a minimal implementation of the basic register
 /// allocation algorithm. It prioritizes live virtual registers by spill weight
 /// and spills whenever a register is unavailable. This is not practical in
@@ -74,6 +93,14 @@ class RAParallel : public MachineFunctionPass,
 
   bool LRE_CanEraseVirtReg(Register) override;
   void LRE_WillShrinkVirtReg(Register) override;
+
+  /// Computes an interference graph from the live intervals in the function.
+  IGraph computeInterference();
+
+  /// Allocates physical registers for a set of virtual registers.
+  void allocPhysRegsPartial(const std::vector<Register> &VRegs);
+  /// Recursively allocates physical registers for a partition tree.
+  void allocPhysRegsTree(const PartitionTree &T);
 
 public:
   RAParallel(const RegClassFilterFunc F = allocateAllRegClasses);
@@ -124,6 +151,165 @@ public:
 
   static char ID;
 };
+
+/// Gets a perfect (simplicial) elimination order of the interference graph G,
+/// in reverse so that index 0 is v_n.
+std::vector<Register> perfectElimOrder(const IGraph &G) {
+  // maximum cardinality search, generates a perfect elimination order bc
+  // ssa interference graphs are chordal
+  std::vector<Register> Order;
+  std::vector<std::pair<Register, int>> Heap;
+  std::map<Register, int> Weights;
+  std::set<Register> Numbered;
+  for (auto [V, _] : G) {
+    Heap.push_back(std::make_pair(V, 0));
+    Weights.insert(std::make_pair(V, 0));
+  }
+  const auto Comp = [](const std::pair<Register, int> &A,
+                       const std::pair<Register, int> &B) {
+    return A.second < B.second;
+  };
+  while (!Heap.empty()) {
+    std::pop_heap(Heap.begin(), Heap.end(), Comp);
+    auto [V, W] = Heap.back();
+    Heap.pop_back();
+    if (Numbered.find(V) != Numbered.end()) {
+      continue;
+    }
+    Numbered.insert(V);
+    Order.push_back(V);
+    for (auto U : G.at(V)) {
+      if (Numbered.find(U) != Numbered.end()) {
+        continue;
+      }
+      Weights[U] += 1;
+      Heap.push_back(std::make_pair(U, Weights[U]));
+      std::push_heap(Heap.begin(), Heap.end(), Comp);
+    }
+  }
+  return Order;
+}
+
+/// Returns true if Clique is a complete subgraph of G.
+bool isCompleteSubgraph(const IGraph &G, const std::set<Register> &Clique) {
+  for (auto V : Clique) {
+    for (auto U : Clique) {
+      if (V == U) {
+        continue;
+      }
+      if (G.at(V).find(U) == G.at(V).end()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/// Gets the connected component of G containing X, excluding the registers in
+/// Exclude.
+std::set<Register> connectedComponent(const IGraph &G,
+                                      const std::set<Register> &Exclude,
+                                      Register X) {
+  std::set<Register> Component;
+  std::queue<Register> Q;
+  Q.push(X);
+  while (!Q.empty()) {
+    auto V = Q.front();
+    Q.pop();
+    if (Component.find(V) != Component.end()) {
+      continue;
+    }
+    Component.insert(V);
+    for (auto U : G.at(V)) {
+      if (Component.find(U) != Component.end() ||
+          Exclude.find(U) != Exclude.end()) {
+        continue;
+      }
+      Q.push(U);
+    }
+  }
+  return Component;
+}
+
+/// Returns the induced subgraph of Set in G.
+IGraph inducedSubgraph(const IGraph &G, std::set<Register> &Set) {
+  IGraph Subgraph;
+  for (auto V : Set) {
+    Subgraph.insert(std::make_pair(V, std::set<Register>()));
+    for (auto U : G.at(V)) {
+      if (Set.find(U) != Set.end()) {
+        Subgraph[V].insert(U);
+      }
+    }
+  }
+  return Subgraph;
+}
+
+/// Removes the nodes of S from G.
+IGraph operator-(const IGraph &G, const std::set<Register> &S) {
+  IGraph H = G;
+  for (auto N : S) {
+    H.erase(N);
+    for (auto &[_, Neighbors] : H) {
+      Neighbors.erase(N);
+    }
+  }
+  return H;
+}
+
+/// Builds a partition tree from a set of atoms. The tree will be
+/// a right-associative binary tree.
+PartitionTree partitionTreeFromAtoms(const std::vector<IGraph> &Atoms) {
+  PartitionTree T;
+  PartitionTree *Last = &T;
+  for (unsigned Idx = 0; Idx < Atoms.size(); ++Idx) {
+    if (Idx < Atoms.size() - 1) {
+      Last->Left = std::make_unique<PartitionTree>();
+      for (auto &[N, _] : Atoms[Idx]) {
+        Last->Left->Regs.push_back(N);
+      }
+      Last->Right = std::make_unique<PartitionTree>();
+      Last = Last->Right.get();
+    } else {
+      for (auto &[N, _] : Atoms[Idx]) {
+        Last->Regs.push_back(N);
+      }
+    }
+  }
+  return T;
+}
+
+/// Builds a partition tree from the interference graph G.
+/// G is assumed to be chordal, however if it is not, the algorithm will still
+/// be correct (probably?), just not optimal.
+PartitionTree buildPartitionTree(const IGraph &G) {
+  auto GPrime = G;
+  auto PEO = perfectElimOrder(G);
+  std::map<Register, size_t> Indices;
+  for (size_t Idx = 0; Idx < PEO.size(); ++Idx) {
+    Indices.insert(std::make_pair(PEO[Idx], Idx));
+  }
+  std::vector<IGraph> Atoms;
+  for (unsigned Idx = 0; Idx < PEO.size(); ++Idx) {
+    auto &V = PEO[Idx];
+    std::set<Register> Clique;
+    for (auto U : G.at(V)) {
+      if (Indices[U] > Idx) {
+        Clique.insert(U);
+      }
+    }
+    if (isCompleteSubgraph(G, Clique)) {
+      const auto Component = connectedComponent(GPrime, Clique, V);
+      auto VertexSet = Component;
+      for (auto &N : Clique) {
+        VertexSet.insert(N);
+      }
+      Atoms.emplace_back(inducedSubgraph(GPrime, VertexSet));
+      GPrime = GPrime - Component;
+    }
+  }
+  return partitionTreeFromAtoms(Atoms);
+}
 
 char RAParallel::ID = 0;
 
@@ -306,6 +492,39 @@ MCRegister RAParallel::selectOrSplit(const LiveInterval &VirtReg,
   return 0;
 }
 
+IGraph RAParallel::computeInterference() {
+  IGraph G;
+  auto &MRI = MF->getRegInfo();
+  // const auto *TRI = MF->getSubtarget().getRegisterInfo();
+  for (unsigned Idx = 0; Idx < MRI.getNumVirtRegs(); ++Idx) {
+    Register Reg = Register::index2VirtReg(Idx);
+    if (MRI.reg_nodbg_empty(Reg)) {
+      continue;
+    }
+    for (unsigned Idx2 = 0; Idx2 < MRI.getNumVirtRegs(); ++Idx2) {
+      Register Reg2 = Register::index2VirtReg(Idx2);
+      if (MRI.reg_nodbg_empty(Reg2)) {
+        continue;
+      }
+      if (Reg == Reg2) {
+        continue;
+      }
+      if (LIS->getInterval(Reg).overlaps(LIS->getInterval(Reg2)) &&
+          MRI.getRegClassOrNull(Reg) == MRI.getRegClassOrNull(Reg2)) {
+        if (G.find(Reg) == G.end()) {
+          G.insert(std::make_pair(Reg, std::set<Register>()));
+        }
+        if (G.find(Reg2) == G.end()) {
+          G.insert(std::make_pair(Reg2, std::set<Register>()));
+        }
+        G[Reg].insert(Reg2);
+        G[Reg2].insert(Reg);
+      }
+    }
+  }
+  return G;
+}
+
 bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
   LLVM_DEBUG(dbgs() << "********** Parallel REGISTER ALLOCATION **********\n"
                     << "********** Function: " << Mf.getName() << '\n');
@@ -319,7 +538,8 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
 
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
 
-  allocatePhysRegs();
+  const auto T = buildPartitionTree(computeInterference());
+  allocPhysRegsTree(T);
   postOptimization();
 
   // Diagnostic output before rewriting
@@ -335,4 +555,106 @@ FunctionPass *llvm::createParallelRegisterAllocator() {
 
 FunctionPass *llvm::createParallelRegisterAllocator(RegClassFilterFunc F) {
   return new RAParallel(F);
+}
+
+void RAParallel::allocPhysRegsTree(const PartitionTree &T) {
+  if (T.Left && T.Right) {
+    // TODO: spawn task for left subtree
+    allocPhysRegsTree(*T.Left);
+    allocPhysRegsTree(*T.Right);
+    // TODO: merge results
+  } else {
+    assert(!T.Left && !T.Right && "expected leaf node");
+    allocPhysRegsPartial(T.Regs);
+  }
+}
+
+void RAParallel::allocPhysRegsPartial(const std::vector<Register> &VRegs) {
+  for (auto &V : VRegs) {
+    if (MRI->reg_nodbg_empty(V)) {
+      continue;
+    }
+    enqueue(&LIS->getInterval(V));
+  }
+
+  // Continue assigning vregs one at a time to available physical registers.
+  while (const LiveInterval *VirtReg = dequeue()) {
+    if (VRM->hasPhys(VirtReg->reg())) {
+      // already allocated
+      continue;
+    }
+
+    // Unused registers can appear when the spiller coalesces snippets.
+    if (MRI->reg_nodbg_empty(VirtReg->reg())) {
+      LLVM_DEBUG(dbgs() << "Dropping unused " << *VirtReg << '\n');
+      aboutToRemoveInterval(*VirtReg);
+      LIS->removeInterval(VirtReg->reg());
+      continue;
+    }
+
+    // Invalidate all interference queries, live ranges could have changed.
+    Matrix->invalidateVirtRegs();
+
+    // selectOrSplit requests the allocator to return an available physical
+    // register if possible and populate a list of new live intervals that
+    // result from splitting.
+    LLVM_DEBUG(dbgs() << "\nselectOrSplit "
+                      << TRI->getRegClassName(MRI->getRegClass(VirtReg->reg()))
+                      << ':' << *VirtReg << " w=" << VirtReg->weight() << '\n');
+
+    using VirtRegVec = SmallVector<Register, 4>;
+
+    VirtRegVec SplitVRegs;
+    MCRegister AvailablePhysReg = selectOrSplit(*VirtReg, SplitVRegs);
+
+    if (AvailablePhysReg == ~0u) {
+      // selectOrSplit failed to find a register!
+      // Probably caused by an inline asm.
+      MachineInstr *MI = nullptr;
+      for (MachineRegisterInfo::reg_instr_iterator
+               I = MRI->reg_instr_begin(VirtReg->reg()),
+               E = MRI->reg_instr_end();
+           I != E;) {
+        MI = &*(I++);
+        if (MI->isInlineAsm())
+          break;
+      }
+
+      const TargetRegisterClass *RC = MRI->getRegClass(VirtReg->reg());
+      ArrayRef<MCPhysReg> AllocOrder = RegClassInfo.getOrder(RC);
+      if (AllocOrder.empty())
+        report_fatal_error("no registers from class available to allocate");
+      else if (MI && MI->isInlineAsm()) {
+        MI->emitError("inline assembly requires more registers than available");
+      } else if (MI) {
+        LLVMContext &Context =
+            MI->getParent()->getParent()->getMMI().getModule()->getContext();
+        Context.emitError("ran out of registers during register allocation");
+      } else {
+        report_fatal_error("ran out of registers during register allocation");
+      }
+
+      // Keep going after reporting the error.
+      VRM->assignVirt2Phys(VirtReg->reg(), AllocOrder.front());
+    } else if (AvailablePhysReg)
+      Matrix->assign(*VirtReg, AvailablePhysReg);
+
+    for (Register Reg : SplitVRegs) {
+      assert(LIS->hasInterval(Reg));
+
+      LiveInterval *SplitVirtReg = &LIS->getInterval(Reg);
+      assert(!VRM->hasPhys(SplitVirtReg->reg()) && "Register already assigned");
+      if (MRI->reg_nodbg_empty(SplitVirtReg->reg())) {
+        assert(SplitVirtReg->empty() && "Non-empty but used interval");
+        LLVM_DEBUG(dbgs() << "not queueing unused  " << *SplitVirtReg << '\n');
+        aboutToRemoveInterval(*SplitVirtReg);
+        LIS->removeInterval(SplitVirtReg->reg());
+        continue;
+      }
+      LLVM_DEBUG(dbgs() << "queuing new interval: " << *SplitVirtReg << "\n");
+      assert(SplitVirtReg->reg().isVirtual() &&
+             "expect split value in virtual register");
+      enqueue(SplitVirtReg);
+    }
+  }
 }
