@@ -36,6 +36,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <fstream>
 #include <initializer_list>
 #include <queue>
 #include <unordered_map>
@@ -48,6 +49,10 @@ using namespace llvm;
 static RegisterRegAlloc ParallelRegAlloc("parallel",
                                          "parallel register allocator",
                                          createParallelRegisterAllocator);
+
+static cl::opt<std::string> OutputInterferenceGraph{
+    "debug-graph", cl::desc("Specify file to write interference graph to"),
+    cl::value_desc("filename")};
 
 namespace {
 struct CompSpillWeight {
@@ -152,8 +157,7 @@ public:
   static char ID;
 };
 
-/// Gets a perfect (simplicial) elimination order of the interference graph G,
-/// in reverse so that index 0 is v_n.
+/// Gets a perfect (simplicial) elimination order of the interference graph G.
 std::vector<Register> perfectElimOrder(const IGraph &G) {
   // maximum cardinality search, generates a perfect elimination order bc
   // ssa interference graphs are chordal
@@ -165,10 +169,12 @@ std::vector<Register> perfectElimOrder(const IGraph &G) {
     Heap.push_back(std::make_pair(V, 0));
     Weights.insert(std::make_pair(V, 0));
   }
+  Order.resize(G.size());
   const auto Comp = [](const std::pair<Register, int> &A,
                        const std::pair<Register, int> &B) {
     return A.second < B.second;
   };
+  int N = G.size() - 1;
   while (!Heap.empty()) {
     std::pop_heap(Heap.begin(), Heap.end(), Comp);
     auto [V, W] = Heap.back();
@@ -177,7 +183,7 @@ std::vector<Register> perfectElimOrder(const IGraph &G) {
       continue;
     }
     Numbered.insert(V);
-    Order.push_back(V);
+    Order[N--] = V;
     for (auto U : G.at(V)) {
       if (Numbered.find(U) != Numbered.end()) {
         continue;
@@ -216,15 +222,12 @@ std::set<Register> connectedComponent(const IGraph &G,
   while (!Q.empty()) {
     auto V = Q.front();
     Q.pop();
-    if (Component.find(V) != Component.end()) {
+    if (Component.find(V) != Component.end() ||
+        Exclude.find(V) != Exclude.end()) {
       continue;
     }
     Component.insert(V);
     for (auto U : G.at(V)) {
-      if (Component.find(U) != Component.end() ||
-          Exclude.find(U) != Exclude.end()) {
-        continue;
-      }
       Q.push(U);
     }
   }
@@ -282,9 +285,15 @@ PartitionTree partitionTreeFromAtoms(const std::vector<IGraph> &Atoms) {
 /// Builds a partition tree from the interference graph G.
 /// G is assumed to be chordal, however if it is not, the algorithm will still
 /// be correct (probably?), just not optimal.
-PartitionTree buildPartitionTree(const IGraph &G) {
+PartitionTree buildPartitionTree(const IGraph &G,
+                                 const TargetRegisterInfo *TRI) {
   auto GPrime = G;
+  LLVM_DEBUG(dbgs() << "***** Elimination Order: *****\n");
   auto PEO = perfectElimOrder(G);
+  for (auto &R : PEO) {
+    LLVM_DEBUG(dbgs() << printReg(R, TRI) << ", ");
+  }
+  LLVM_DEBUG(dbgs() << "\n");
   std::map<Register, size_t> Indices;
   for (size_t Idx = 0; Idx < PEO.size(); ++Idx) {
     Indices.insert(std::make_pair(PEO[Idx], Idx));
@@ -309,6 +318,38 @@ PartitionTree buildPartitionTree(const IGraph &G) {
     }
   }
   return partitionTreeFromAtoms(Atoms);
+}
+
+/// Writes the interference to a file if one is supplied
+void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI) {
+  if (OutputInterferenceGraph.hasArgStr()) {
+    const auto Filename = OutputInterferenceGraph.getValue();
+    std::string OutTxt;
+    llvm::raw_string_ostream Out(OutTxt);
+    Out << "graph Interferance {\n";
+    Out << "\tfontname=\"Helvetica\";\n";
+    Out << "\tnode [fontname=\"Helvetica\"];\n";
+    Out << "\tedge [fontname=\"Helvetica\"];\n";
+    Out << "\tlayout=fdp;\n";
+    std::set<std::pair<Register, Register>> ProcessedEdges;
+    for (auto &[V, _] : G) {
+      Out << "\tn" << V.id() << " [label=\"" << printReg(V, TRI) << "\"];\n";
+    }
+    for (auto &[V, Neighbors] : G) {
+      for (auto U : Neighbors) {
+        if (ProcessedEdges.find(std::make_pair(U, V)) != ProcessedEdges.end()) {
+          continue;
+        }
+        Out << "\tn" << V.id() << " -- n" << U.id() << ";\n";
+        ProcessedEdges.insert(std::make_pair(V, U));
+        ProcessedEdges.insert(std::make_pair(U, V));
+      }
+    }
+    Out << "}\n";
+    Out.flush();
+    std::ofstream OutFile(Filename);
+    OutFile << OutTxt << std::endl;
+  }
 }
 
 char RAParallel::ID = 0;
@@ -495,7 +536,6 @@ MCRegister RAParallel::selectOrSplit(const LiveInterval &VirtReg,
 IGraph RAParallel::computeInterference() {
   IGraph G;
   auto &MRI = MF->getRegInfo();
-  // const auto *TRI = MF->getSubtarget().getRegisterInfo();
   for (unsigned Idx = 0; Idx < MRI.getNumVirtRegs(); ++Idx) {
     Register Reg = Register::index2VirtReg(Idx);
     if (MRI.reg_nodbg_empty(Reg)) {
@@ -507,10 +547,12 @@ IGraph RAParallel::computeInterference() {
         continue;
       }
       if (Reg == Reg2) {
+        if (G.find(Reg) == G.end()) {
+          G.insert(std::make_pair(Reg, std::set<Register>()));
+        }
         continue;
       }
-      if (LIS->getInterval(Reg).overlaps(LIS->getInterval(Reg2)) &&
-          MRI.getRegClassOrNull(Reg) == MRI.getRegClassOrNull(Reg2)) {
+      if (LIS->getInterval(Reg).overlaps(LIS->getInterval(Reg2))) {
         if (G.find(Reg) == G.end()) {
           G.insert(std::make_pair(Reg, std::set<Register>()));
         }
@@ -538,7 +580,9 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
 
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
 
-  const auto T = buildPartitionTree(computeInterference());
+  const auto G = computeInterference();
+  debugInterferenceGraph(G, TRI);
+  const auto T = buildPartitionTree(G, TRI);
   allocPhysRegsTree(T);
   postOptimization();
 
@@ -565,6 +609,11 @@ void RAParallel::allocPhysRegsTree(const PartitionTree &T) {
     // TODO: merge results
   } else {
     assert(!T.Left && !T.Right && "expected leaf node");
+    LLVM_DEBUG(dbgs() << "allocating: ");
+    for (auto &R : T.Regs) {
+      LLVM_DEBUG(dbgs() << printReg(R, TRI) << ", ");
+    }
+    LLVM_DEBUG(dbgs() << "\n");
     allocPhysRegsPartial(T.Regs);
   }
 }
