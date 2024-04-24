@@ -53,6 +53,10 @@ static RegisterRegAlloc ParallelRegAlloc("parallel",
 static cl::opt<std::string> OutputInterferenceGraph{
     "debug-graph", cl::desc("Specify file to write interference graph to"),
     cl::value_desc("filename")};
+static cl::opt<std::string>
+    OutputPartitionTree("debug-partitions",
+                        cl::desc("Specify file to write partition tree to"),
+                        cl::value_desc("filename"));
 
 namespace {
 struct CompSpillWeight {
@@ -71,6 +75,7 @@ using IGraph = std::map<Register, std::set<Register>>;
 struct PartitionTree {
   /// Invariant: Either has both children and no regs or is a leaf and has regs.
   std::unique_ptr<PartitionTree> Left, Right;
+  std::set<Register> SeparatingClique;
   std::vector<Register> Regs;
 };
 
@@ -262,7 +267,10 @@ IGraph operator-(const IGraph &G, const std::set<Register> &S) {
 
 /// Builds a partition tree from a set of atoms. The tree will be
 /// a right-associative binary tree.
-PartitionTree partitionTreeFromAtoms(const std::vector<IGraph> &Atoms) {
+PartitionTree partitionTreeFromAtoms(
+    const std::vector<IGraph> &Atoms,
+    const std::vector<std::set<Register>> &CliqueSeparators) {
+  assert(Atoms.size() == CliqueSeparators.size());
   PartitionTree T;
   PartitionTree *Last = &T;
   for (unsigned Idx = 0; Idx < Atoms.size(); ++Idx) {
@@ -272,6 +280,7 @@ PartitionTree partitionTreeFromAtoms(const std::vector<IGraph> &Atoms) {
         Last->Left->Regs.push_back(N);
       }
       Last->Right = std::make_unique<PartitionTree>();
+      Last->SeparatingClique = CliqueSeparators[Idx];
       Last = Last->Right.get();
     } else {
       for (auto &[N, _] : Atoms[Idx]) {
@@ -299,6 +308,7 @@ PartitionTree buildPartitionTree(const IGraph &G,
     Indices.insert(std::make_pair(PEO[Idx], Idx));
   }
   std::vector<IGraph> Atoms;
+  std::vector<std::set<Register>> CliqueSeparators;
   for (unsigned Idx = 0; Idx < PEO.size(); ++Idx) {
     auto &V = PEO[Idx];
     std::set<Register> Clique;
@@ -314,16 +324,21 @@ PartitionTree buildPartitionTree(const IGraph &G,
         VertexSet.insert(N);
       }
       Atoms.emplace_back(inducedSubgraph(GPrime, VertexSet));
+      CliqueSeparators.emplace_back(std::move(Clique));
       GPrime = GPrime - Component;
     }
   }
-  return partitionTreeFromAtoms(Atoms);
+  return partitionTreeFromAtoms(Atoms, CliqueSeparators);
 }
 
 /// Writes the interference to a file if one is supplied
-void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI) {
+void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI,
+                            const std::string &FuncName) {
   if (OutputInterferenceGraph.hasArgStr()) {
     const auto Filename = OutputInterferenceGraph.getValue();
+    if (Filename.empty()) {
+      return;
+    }
     std::string OutTxt;
     llvm::raw_string_ostream Out(OutTxt);
     Out << "graph Interferance {\n";
@@ -347,7 +362,67 @@ void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI) {
     }
     Out << "}\n";
     Out.flush();
-    std::ofstream OutFile(Filename);
+    std::ofstream OutFile(FuncName + "_" + Filename);
+    OutFile << OutTxt << std::endl;
+  }
+}
+
+/// Writes the partition tree to a file if one is supplied
+void debugPartitionTree(const PartitionTree &T, const TargetRegisterInfo *TRI,
+                        const std::string &FuncName) {
+  if (OutputPartitionTree.hasArgStr()) {
+    const auto Filename = OutputPartitionTree.getValue();
+    if (Filename.empty()) {
+      return;
+    }
+    std::string OutTxt;
+    llvm::raw_string_ostream Out(OutTxt);
+    Out << "digraph PartitionTree {\n";
+    Out << "\tfontname=\"Helvetica\";\n";
+    Out << "\tnode [fontname=\"Helvetica\"];\n";
+    Out << "\tedge [fontname=\"Helvetica\"];\n";
+    Out << "\tlayout=dot;\n";
+    Out << "\trankdir=\"TB\";\n";
+    std::vector<std::pair<const PartitionTree *, int>> Q;
+    Q.push_back(std::make_pair(&T, 0));
+    int GlobalId = 0;
+    while (!Q.empty()) {
+      auto [Node, Id] = Q.back();
+      Q.pop_back();
+      Out << "\tn" << Id << " [label=";
+      if (Node->Left && Node->Right) {
+        assert(Node->Regs.empty());
+        Out << "\"{";
+        for (auto N : Node->SeparatingClique) {
+          Out << printReg(N, TRI);
+          if (N != *Node->SeparatingClique.rbegin()) {
+            Out << ", ";
+          }
+        }
+        Out << "}\"];\n";
+        const auto LId = ++GlobalId;
+        const auto RId = ++GlobalId;
+        Out << "\tn" << Id << " -> n" << LId << ";\n";
+        Out << "\tn" << Id << " -> n" << RId << ";\n";
+        Q.emplace_back(Node->Left.get(), LId);
+        Q.emplace_back(Node->Right.get(), RId);
+      } else {
+        Out << "\"{";
+        // NOLINTNEXTLINE(readability-identifier-naming)
+        for (auto i = 0u; i < Node->Regs.size(); ++i) {
+          auto &R = Node->Regs[i];
+          Out << printReg(R, TRI);
+          if (i < Node->Regs.size() - 1) {
+            Out << ", ";
+          }
+        }
+        Out << "}\"];\n";
+      }
+      ++Id;
+    }
+    Out << "}\n";
+    Out.flush();
+    std::ofstream OutFile(FuncName + "_" + Filename);
     OutFile << OutTxt << std::endl;
   }
 }
@@ -579,10 +654,10 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
   VRAI.calculateSpillWeightsAndHints();
 
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
-
   const auto G = computeInterference();
-  debugInterferenceGraph(G, TRI);
+  debugInterferenceGraph(G, TRI, MF->getName().str());
   const auto T = buildPartitionTree(G, TRI);
+  debugPartitionTree(T, TRI, MF->getName().str());
   allocPhysRegsTree(T);
   postOptimization();
 
