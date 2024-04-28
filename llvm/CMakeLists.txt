@@ -2,6 +2,7 @@
 
 cmake_minimum_required(VERSION 3.20.0)
 set(EXPORT_COMPILE_COMMANDS ON)
+add_link_options("-fuse-ld=lld")
 
 set(LLVM_COMMON_CMAKE_UTILS ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
 include(${LLVM_COMMON_CMAKE_UTILS}/Modules/CMakePolicy.cmake

@@ -1,5 +1,7 @@
 [envs.reg_alloc]
-command = '''clang++ {filename} -O0 -S -emit-llvm -o /dev/stdout | \
+command = '''clang++ {filename} -O1 -mllvm -disable-llvm-optzns \
+                -S -emit-llvm -o /dev/stdout | \
+              ../../build/bin/opt -passes="mem2reg" | \
               ../../build/bin/llc --regalloc=parallel | \
               clang++ -no-pie -x assembler - -o a && \
               ./a'''

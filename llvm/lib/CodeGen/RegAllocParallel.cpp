@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AllocationOrder.h"
+#include "IGraph.hpp"
 #include "LiveDebugVariables.h"
 #include "RegAllocBase.h"
 #include "llvm/ADT/DirectedGraph.h"
@@ -26,12 +27,14 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/Spiller.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/MC/MCRegister.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -41,6 +44,7 @@
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 
 using namespace llvm;
 
@@ -67,16 +71,73 @@ struct CompSpillWeight {
 } // namespace
 
 namespace {
-using IGraph = std::map<Register, std::set<Register>>;
 
-/// A partition tree is a binary tree that represents a partition of a set of
-/// registers. Each leaf node contains a set of registers, and each internal
-/// node contains two children and no registers.
-struct PartitionTree {
-  /// Invariant: Either has both children and no regs or is a leaf and has regs.
-  std::unique_ptr<PartitionTree> Left, Right;
-  std::set<Register> SeparatingClique;
-  std::vector<Register> Regs;
+struct ColoringResult {
+  // Color Union-Find
+  class Color {
+    // Physical register or parent
+    std::variant<MCRegister, std::shared_ptr<Color>> Value;
+
+  private:
+    Color *getRoot() {
+      return std::visit(
+          [this](auto &&V) {
+            using T = std::decay_t<decltype(V)>;
+            if constexpr (std::is_same_v<MCRegister, T>) {
+              return this;
+            } else {
+              return V->getRoot();
+            }
+          },
+          Value);
+    }
+
+    /// Gets the root of the current node in the union-find data structure.
+    /// Requires that the current node is not a physical register (not a root)
+    std::shared_ptr<Color> getRootHelper() const {
+      auto Parent = std::get<std::shared_ptr<Color>>(Value);
+      return std::visit(
+          [Parent](auto &&Val) {
+            using T = std::decay_t<decltype(Val)>;
+            if constexpr (std::is_same_v<MCRegister, T>) {
+              return Parent;
+            } else {
+              return Parent->getRootHelper();
+            }
+          },
+          Parent->Value);
+    }
+
+  public:
+    /// Gets the physical register for this color
+    MCRegister getPReg() {
+      if (std::holds_alternative<MCRegister>(Value)) {
+        return std::get<MCRegister>(Value);
+      }
+      Value = getRootHelper();
+      auto Ptr = std::get<std::shared_ptr<Color>>(Value);
+      assert(Ptr != nullptr);
+      return Ptr->getPReg();
+    }
+
+    /// Sets the color of all nodes in the class to be the specified color
+    /// @{
+    void setColor(const std::shared_ptr<Color> &C) {
+      getRoot()->Value = C;
+      Value = C;
+    }
+    void setColor(std::shared_ptr<Color> &&C) { setColor(C); }
+    void setColor(MCRegister PReg) { getRoot()->Value = PReg; }
+    /// @}
+
+    Color(std::variant<MCRegister, std::shared_ptr<Color>> Value)
+        : Value(std::move(Value)) {}
+  };
+  /// Set of physical registers used.
+  std::vector<std::shared_ptr<Color>> Colors;
+  /// Map virtual register to physical register by the index in `Colors`.
+  /// A register that maps to `None` is spilled.
+  std::map<Register, std::shared_ptr<Color>> RegToColor;
 };
 
 /// RAParallel provides a minimal implementation of the basic register
@@ -105,12 +166,50 @@ class RAParallel : public MachineFunctionPass,
   void LRE_WillShrinkVirtReg(Register) override;
 
   /// Computes an interference graph from the live intervals in the function.
-  IGraph computeInterference();
+  [[nodiscard]] IGraph computeInterference();
 
   /// Allocates physical registers for a set of virtual registers.
-  void allocPhysRegsPartial(const std::vector<Register> &VRegs);
+  void allocPhysRegsFinal(const ColoringResult &Coloring);
   /// Recursively allocates physical registers for a partition tree.
-  void allocPhysRegsTree(const PartitionTree &T);
+  [[nodiscard]] ColoringResult colorPhysRegsTree(const PartitionTree &T) const;
+
+  /// Performs register allocation on a leaf node of the partition tree
+  [[nodiscard]] ColoringResult localColor(const IGraph &G) const;
+  /// Returns true if `VReg` interferes with `PReg` given the current
+  /// interference graph and coloring.
+  [[nodiscard]] bool doesInterfere(const IGraph &G,
+                                   const ColoringResult &CurColoring,
+                                   Register VReg, MCRegister PReg) const;
+  /// Merges two coloring results together of sibilings in the partition tree
+  /// Requires that the only shared virtual registers between the two coloring
+  /// results are in the clique.
+  [[nodiscard]] ColoringResult
+  mergeResults(ColoringResult &&A, ColoringResult &&B,
+               const std::set<Register> &Clique) const;
+
+  /// Gets an available color for `NodePReg` from `AvailableColors`. If
+  /// `MustChange` is true, the color must be different from `NodePReg`. If the
+  /// color hasn't been used before, adds it to the `Result.Colors` list.
+  /// The returned color is *NOT* removed from `AvailableColors`.
+  [[nodiscard]] std::shared_ptr<ColoringResult::Color>
+  getAvailableColor(Register VReg, MCRegister CurPReg,
+                    std::set<MCRegister> &UsedColors, ColoringResult &Result,
+                    std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
+                        &ExistingColors,
+                    bool MustChange = false) const;
+
+  /// Recolors the right subgraph of the partition tree. Registers in the right
+  /// subgraph that are in `NeedColors` will be colored with a new color.
+  /// Registers in the right subgraph that are already colored will be recolored
+  /// if they have not been recolored already (not in `ColorsToChange`).
+  /// @return The new coloring result with the right subgraph colored and added
+  /// to the existing coloring result.
+  ColoringResult
+  recolorRight(std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
+                   &ExistingColors,
+               std::set<MCRegister> &UsedColors, std::set<Register> &NeedColors,
+               std::set<MCRegister> &ColorsToChange, ColoringResult &Right,
+               ColoringResult &&Result) const;
 
 public:
   RAParallel(const RegClassFilterFunc F = allocateAllRegClasses);
@@ -162,272 +261,15 @@ public:
   static char ID;
 };
 
-/// Gets a perfect (simplicial) elimination order of the interference graph G.
-std::vector<Register> perfectElimOrder(const IGraph &G) {
-  // maximum cardinality search, generates a perfect elimination order bc
-  // ssa interference graphs are chordal
-  std::vector<Register> Order;
-  std::vector<std::pair<Register, int>> Heap;
-  std::map<Register, int> Weights;
-  std::set<Register> Numbered;
-  for (auto [V, _] : G) {
-    Heap.push_back(std::make_pair(V, 0));
-    Weights.insert(std::make_pair(V, 0));
-  }
-  Order.resize(G.size());
-  const auto Comp = [](const std::pair<Register, int> &A,
-                       const std::pair<Register, int> &B) {
-    return A.second < B.second;
-  };
-  int N = G.size() - 1;
-  while (!Heap.empty()) {
-    std::pop_heap(Heap.begin(), Heap.end(), Comp);
-    auto [V, W] = Heap.back();
-    Heap.pop_back();
-    if (Numbered.find(V) != Numbered.end()) {
-      continue;
-    }
-    Numbered.insert(V);
-    Order[N--] = V;
-    for (auto U : G.at(V)) {
-      if (Numbered.find(U) != Numbered.end()) {
-        continue;
-      }
-      Weights[U] += 1;
-      Heap.push_back(std::make_pair(U, Weights[U]));
-      std::push_heap(Heap.begin(), Heap.end(), Comp);
-    }
-  }
-  return Order;
-}
-
-/// Returns true if Clique is a complete subgraph of G.
-bool isCompleteSubgraph(const IGraph &G, const std::set<Register> &Clique) {
-  for (auto V : Clique) {
-    for (auto U : Clique) {
-      if (V == U) {
-        continue;
-      }
-      if (G.at(V).find(U) == G.at(V).end()) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-
-/// Gets the connected component of G containing X, excluding the registers in
-/// Exclude.
-std::set<Register> connectedComponent(const IGraph &G,
-                                      const std::set<Register> &Exclude,
-                                      Register X) {
-  std::set<Register> Component;
-  std::queue<Register> Q;
-  Q.push(X);
-  while (!Q.empty()) {
-    auto V = Q.front();
-    Q.pop();
-    if (Component.find(V) != Component.end() ||
-        Exclude.find(V) != Exclude.end()) {
-      continue;
-    }
-    Component.insert(V);
-    for (auto U : G.at(V)) {
-      Q.push(U);
-    }
-  }
-  return Component;
-}
-
-/// Returns the induced subgraph of Set in G.
-IGraph inducedSubgraph(const IGraph &G, std::set<Register> &Set) {
-  IGraph Subgraph;
-  for (auto V : Set) {
-    Subgraph.insert(std::make_pair(V, std::set<Register>()));
-    for (auto U : G.at(V)) {
-      if (Set.find(U) != Set.end()) {
-        Subgraph[V].insert(U);
-      }
-    }
-  }
-  return Subgraph;
-}
-
-/// Removes the nodes of S from G.
-IGraph operator-(const IGraph &G, const std::set<Register> &S) {
-  IGraph H = G;
-  for (auto N : S) {
-    H.erase(N);
-    for (auto &[_, Neighbors] : H) {
-      Neighbors.erase(N);
-    }
-  }
-  return H;
-}
-
-/// Builds a partition tree from a set of atoms. The tree will be
-/// a right-associative binary tree.
-PartitionTree partitionTreeFromAtoms(
-    const std::vector<IGraph> &Atoms,
-    const std::vector<std::set<Register>> &CliqueSeparators) {
-  assert(Atoms.size() == CliqueSeparators.size());
-  PartitionTree T;
-  PartitionTree *Last = &T;
-  for (unsigned Idx = 0; Idx < Atoms.size(); ++Idx) {
-    if (Idx < Atoms.size() - 1) {
-      Last->Left = std::make_unique<PartitionTree>();
-      for (auto &[N, _] : Atoms[Idx]) {
-        Last->Left->Regs.push_back(N);
-      }
-      Last->Right = std::make_unique<PartitionTree>();
-      Last->SeparatingClique = CliqueSeparators[Idx];
-      Last = Last->Right.get();
-    } else {
-      for (auto &[N, _] : Atoms[Idx]) {
-        Last->Regs.push_back(N);
-      }
-    }
-  }
-  return T;
-}
-
-/// Builds a partition tree from the interference graph G.
-/// G is assumed to be chordal, however if it is not, the algorithm will still
-/// be correct (probably?), just not optimal.
-PartitionTree buildPartitionTree(const IGraph &G,
-                                 const TargetRegisterInfo *TRI) {
-  auto GPrime = G;
-  LLVM_DEBUG(dbgs() << "***** Elimination Order: *****\n");
-  auto PEO = perfectElimOrder(G);
-  for (auto &R : PEO) {
-    LLVM_DEBUG(dbgs() << printReg(R, TRI) << ", ");
-  }
-  LLVM_DEBUG(dbgs() << "\n");
-  std::map<Register, size_t> Indices;
-  for (size_t Idx = 0; Idx < PEO.size(); ++Idx) {
-    Indices.insert(std::make_pair(PEO[Idx], Idx));
-  }
-  std::vector<IGraph> Atoms;
-  std::vector<std::set<Register>> CliqueSeparators;
-  for (unsigned Idx = 0; Idx < PEO.size(); ++Idx) {
-    auto &V = PEO[Idx];
-    std::set<Register> Clique;
-    for (auto U : G.at(V)) {
-      if (Indices[U] > Idx) {
-        Clique.insert(U);
-      }
-    }
-    if (isCompleteSubgraph(G, Clique)) {
-      const auto Component = connectedComponent(GPrime, Clique, V);
-      auto VertexSet = Component;
-      for (auto &N : Clique) {
-        VertexSet.insert(N);
-      }
-      Atoms.emplace_back(inducedSubgraph(GPrime, VertexSet));
-      CliqueSeparators.emplace_back(std::move(Clique));
-      GPrime = GPrime - Component;
-    }
-  }
-  return partitionTreeFromAtoms(Atoms, CliqueSeparators);
-}
-
-/// Writes the interference to a file if one is supplied
-void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI,
-                            const std::string &FuncName) {
-  if (OutputInterferenceGraph.hasArgStr()) {
-    const auto Filename = OutputInterferenceGraph.getValue();
-    if (Filename.empty()) {
-      return;
-    }
-    std::string OutTxt;
-    llvm::raw_string_ostream Out(OutTxt);
-    Out << "graph Interferance {\n";
-    Out << "\tfontname=\"Helvetica\";\n";
-    Out << "\tnode [fontname=\"Helvetica\"];\n";
-    Out << "\tedge [fontname=\"Helvetica\"];\n";
-    Out << "\tlayout=fdp;\n";
-    std::set<std::pair<Register, Register>> ProcessedEdges;
-    for (auto &[V, _] : G) {
-      Out << "\tn" << V.id() << " [label=\"" << printReg(V, TRI) << "\"];\n";
-    }
-    for (auto &[V, Neighbors] : G) {
-      for (auto U : Neighbors) {
-        if (ProcessedEdges.find(std::make_pair(U, V)) != ProcessedEdges.end()) {
-          continue;
-        }
-        Out << "\tn" << V.id() << " -- n" << U.id() << ";\n";
-        ProcessedEdges.insert(std::make_pair(V, U));
-        ProcessedEdges.insert(std::make_pair(U, V));
-      }
-    }
-    Out << "}\n";
-    Out.flush();
-    std::ofstream OutFile(FuncName + "_" + Filename);
-    OutFile << OutTxt << std::endl;
-  }
-}
-
-/// Writes the partition tree to a file if one is supplied
-void debugPartitionTree(const PartitionTree &T, const TargetRegisterInfo *TRI,
-                        const std::string &FuncName) {
-  if (OutputPartitionTree.hasArgStr()) {
-    const auto Filename = OutputPartitionTree.getValue();
-    if (Filename.empty()) {
-      return;
-    }
-    std::string OutTxt;
-    llvm::raw_string_ostream Out(OutTxt);
-    Out << "digraph PartitionTree {\n";
-    Out << "\tfontname=\"Helvetica\";\n";
-    Out << "\tnode [fontname=\"Helvetica\"];\n";
-    Out << "\tedge [fontname=\"Helvetica\"];\n";
-    Out << "\tlayout=dot;\n";
-    Out << "\trankdir=\"TB\";\n";
-    std::vector<std::pair<const PartitionTree *, int>> Q;
-    Q.push_back(std::make_pair(&T, 0));
-    int GlobalId = 0;
-    while (!Q.empty()) {
-      auto [Node, Id] = Q.back();
-      Q.pop_back();
-      Out << "\tn" << Id << " [label=";
-      if (Node->Left && Node->Right) {
-        assert(Node->Regs.empty());
-        Out << "\"{";
-        for (auto N : Node->SeparatingClique) {
-          Out << printReg(N, TRI);
-          if (N != *Node->SeparatingClique.rbegin()) {
-            Out << ", ";
-          }
-        }
-        Out << "}\"];\n";
-        const auto LId = ++GlobalId;
-        const auto RId = ++GlobalId;
-        Out << "\tn" << Id << " -> n" << LId << ";\n";
-        Out << "\tn" << Id << " -> n" << RId << ";\n";
-        Q.emplace_back(Node->Left.get(), LId);
-        Q.emplace_back(Node->Right.get(), RId);
-      } else {
-        Out << "\"{";
-        // NOLINTNEXTLINE(readability-identifier-naming)
-        for (auto i = 0u; i < Node->Regs.size(); ++i) {
-          auto &R = Node->Regs[i];
-          Out << printReg(R, TRI);
-          if (i < Node->Regs.size() - 1) {
-            Out << ", ";
-          }
-        }
-        Out << "}\"];\n";
-      }
-      ++Id;
-    }
-    Out << "}\n";
-    Out.flush();
-    std::ofstream OutFile(FuncName + "_" + Filename);
-    OutFile << OutTxt << std::endl;
-  }
-}
-
 char RAParallel::ID = 0;
+
+/// Returns true if the order contains the register.
+bool orderContainsReg(const AllocationOrder &Order, MCRegister Reg) {
+  for (MCRegister R : Order)
+    if (R == Reg)
+      return true;
+  return false;
+}
 
 } // end anonymous namespace
 
@@ -561,40 +403,40 @@ bool RAParallel::spillInterferences(const LiveInterval &VirtReg,
 MCRegister RAParallel::selectOrSplit(const LiveInterval &VirtReg,
                                      SmallVectorImpl<Register> &SplitVRegs) {
   // Populate a list of physical register spill candidates.
-  SmallVector<MCRegister, 8> PhysRegSpillCands;
+  // SmallVector<MCRegister, 8> PhysRegSpillCands;
 
-  // Check for an available register in this class.
-  auto Order =
-      AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
-  for (MCRegister PhysReg : Order) {
-    assert(PhysReg.isValid());
-    // Check for interference in PhysReg
-    switch (Matrix->checkInterference(VirtReg, PhysReg)) {
-    case LiveRegMatrix::IK_Free:
-      // PhysReg is available, allocate it.
-      return PhysReg;
+  // // Check for an available register in this class.
+  // auto Order =
+  //     AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
+  // for (MCRegister PhysReg : Order) {
+  //   assert(PhysReg.isValid());
+  //   // Check for interference in PhysReg
+  //   switch (Matrix->checkInterference(VirtReg, PhysReg)) {
+  //   case LiveRegMatrix::IK_Free:
+  //     // PhysReg is available, allocate it.
+  //     return PhysReg;
 
-    case LiveRegMatrix::IK_VirtReg:
-      // Only virtual registers in the way, we may be able to spill them.
-      PhysRegSpillCands.push_back(PhysReg);
-      continue;
+  //   case LiveRegMatrix::IK_VirtReg:
+  //     // Only virtual registers in the way, we may be able to spill them.
+  //     PhysRegSpillCands.push_back(PhysReg);
+  //     continue;
 
-    default:
-      // RegMask or RegUnit interference.
-      continue;
-    }
-  }
+  //   default:
+  //     // RegMask or RegUnit interference.
+  //     continue;
+  //   }
+  // }
 
-  // Try to spill another interfering reg with less spill weight.
-  for (MCRegister &PhysReg : PhysRegSpillCands) {
-    if (!spillInterferences(VirtReg, PhysReg, SplitVRegs))
-      continue;
+  // // Try to spill another interfering reg with less spill weight.
+  // for (MCRegister &PhysReg : PhysRegSpillCands) {
+  //   if (!spillInterferences(VirtReg, PhysReg, SplitVRegs))
+  //     continue;
 
-    assert(!Matrix->checkInterference(VirtReg, PhysReg) &&
-           "Interference after spill.");
-    // Tell the caller to allocate to this newly freed physical register.
-    return PhysReg;
-  }
+  //   assert(!Matrix->checkInterference(VirtReg, PhysReg) &&
+  //          "Interference after spill.");
+  //   // Tell the caller to allocate to this newly freed physical register.
+  //   return PhysReg;
+  // }
 
   // No other spill candidates were found, so spill the current VirtReg.
   LLVM_DEBUG(dbgs() << "spilling: " << VirtReg << '\n');
@@ -634,12 +476,243 @@ IGraph RAParallel::computeInterference() {
         if (G.find(Reg2) == G.end()) {
           G.insert(std::make_pair(Reg2, std::set<Register>()));
         }
-        G[Reg].insert(Reg2);
-        G[Reg2].insert(Reg);
+        if (LIS->getInterval(Reg).hasSubRanges() &&
+            LIS->getInterval(Reg2).hasSubRanges()) {
+          for (auto &Range1 : LIS->getInterval(Reg).subranges()) {
+            for (auto &Range2 : LIS->getInterval(Reg2).subranges()) {
+              if (Range1.overlaps(Range2)) {
+                G[Reg].insert(Reg2);
+                G[Reg2].insert(Reg);
+                goto dbl_break;
+              }
+            }
+          }
+        dbl_break:
+          // NOLINTNEXTLINE
+        } else {
+          G[Reg].insert(Reg2);
+          G[Reg2].insert(Reg);
+        }
       }
     }
   }
   return G;
+}
+
+bool RAParallel::doesInterfere(const IGraph &G,
+                               const ColoringResult &CurColoring, Register VReg,
+                               MCRegister PReg) const {
+  for (auto Neighbor : G.at(VReg)) {
+    if (auto NeighorCol = CurColoring.RegToColor.find(Neighbor);
+        NeighorCol != CurColoring.RegToColor.end() &&
+        NeighorCol->second != nullptr) {
+      const auto NeighborReg = NeighorCol->second->getPReg();
+      if (TRI->regsOverlap(PReg, NeighborReg) ||
+          Matrix->checkInterference(LIS->getInterval(VReg), PReg) !=
+              LiveRegMatrix::IK_Free) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+ColoringResult RAParallel::localColor(const IGraph &G) const {
+  // TODO: better coloring algorithm instead of greedy coloring.
+  ColoringResult Result;
+  std::vector<std::pair<Register, float>> RegHeap;
+  const static auto Cmp = [](const std::pair<Register, float> &A,
+                             const std::pair<Register, float> &B) {
+    return A.second < B.second;
+  };
+  for (auto &[V, _] : G) {
+    // order regs by spill weight to allocate the most costly to spill ones
+    // first
+    RegHeap.push_back(std::make_pair(V, LIS->getInterval(V).weight()));
+    std::push_heap(RegHeap.begin(), RegHeap.end(), Cmp);
+  }
+  std::map<MCRegister, std::shared_ptr<ColoringResult::Color>> UsedColors;
+  while (!RegHeap.empty()) {
+    std::pop_heap(RegHeap.begin(), RegHeap.end(), Cmp);
+    auto [V, _] = RegHeap.back();
+    RegHeap.pop_back();
+    const auto PRegs = AllocationOrder::create(V, *VRM, RegClassInfo, Matrix);
+    bool Colored = false;
+    for (auto PReg : PRegs) {
+      if (!doesInterfere(G, Result, V, PReg)) {
+        // if we have an available color, assign it, otherwise
+        Colored = true;
+        if (auto C = UsedColors.find(PReg); C != UsedColors.end()) {
+          Result.RegToColor.insert(std::make_pair(V, C->second));
+        } else {
+          auto NewColor = std::make_shared<ColoringResult::Color>(PReg);
+          Result.Colors.push_back(NewColor);
+          UsedColors.insert(std::make_pair(PReg, NewColor));
+          Result.RegToColor.insert(std::make_pair(V, NewColor));
+        }
+        break;
+      }
+    }
+    if (!Colored) {
+      Result.RegToColor.insert(std::make_pair(V, nullptr));
+    }
+  }
+  return Result;
+}
+
+/// Gets a `std::shared_ptr<ColoringResult::Color>` for `AvailableColor` from
+/// `ExistingColors`. If the color hasn't been used before, adds it to the
+/// `Result.Colors` list.
+auto chooseColor(MCRegister AvailableColor, ColoringResult &Result,
+                 std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
+                     &ExistingColors) {
+  if (auto ExistingColor = ExistingColors.find(AvailableColor);
+      ExistingColor != ExistingColors.end()) {
+    return ExistingColor->second;
+  }
+  auto NewColor = std::make_shared<ColoringResult::Color>(AvailableColor);
+  Result.Colors.push_back(NewColor);
+  ExistingColors.insert(std::make_pair(AvailableColor, NewColor));
+  return NewColor;
+}
+
+/// Marks `C` and all its register units as used in `UsedColors`.
+void setColorUsed(ColoringResult::Color &C, std::set<MCRegister> &UsedColors,
+                  const TargetRegisterInfo *TRI) {
+  UsedColors.insert(C.getPReg());
+  for (auto Unit : TRI->regunits(C.getPReg())) {
+    UsedColors.insert(Unit);
+  }
+}
+
+/// Returns true if `Color` is available in `UsedColors`. Checks for
+/// `Color` and all its register units in `UsedColors` to determine if it is
+/// available.
+[[nodiscard]] bool colorIsAvailable(MCRegister Color,
+                                    std::set<MCRegister> &UsedColors,
+                                    const TargetRegisterInfo *TRI) {
+  if (UsedColors.find(Color) != UsedColors.end()) {
+    // UsedColors contains the color
+    return false;
+  }
+  for (auto Unit : TRI->regunits(Color)) {
+    if (UsedColors.find(Unit) != UsedColors.end()) {
+      // Used colors contains a reg unit of the color
+      return false;
+    }
+  }
+  return true;
+}
+
+ColoringResult RAParallel::recolorRight(
+    std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
+        &ExistingColors,
+    std::set<MCRegister> &UsedColors, std::set<Register> &NeedColors,
+    std::set<MCRegister> &ColorsToChange, ColoringResult &Right,
+    ColoringResult &&Result) const {
+  // for nodes in the clique that need colors in the right subgraph
+  for (auto &Node : NeedColors) {
+    // node is spilled in the left subgraph but not the right subgraph
+    auto NodeColor = Right.RegToColor.at(Node);
+    auto NodePReg = NodeColor->getPReg();
+    // we must change the color
+    auto NewColor = getAvailableColor(Node, NodePReg, UsedColors, Result,
+                                      ExistingColors, true);
+    setColorUsed(*NewColor, UsedColors, TRI);
+    ColorsToChange.erase(NodePReg);
+
+    assert(NewColor != nullptr);
+    NodeColor->setColor(NewColor);
+  }
+  for (auto &[Reg, Color] : Right.RegToColor) {
+    Result.RegToColor.insert(std::make_pair(Reg, Color));
+    if (Color != nullptr) {
+      if (auto It = ColorsToChange.find(Color->getPReg());
+          It != ColorsToChange.end()) {
+        ColorsToChange.erase(It);
+        Color->setColor(getAvailableColor(Reg, Color->getPReg(), UsedColors,
+                                          Result, ExistingColors));
+        setColorUsed(*Color, UsedColors, TRI);
+      }
+    }
+  }
+  return Result;
+}
+
+ColoringResult
+RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
+                         const std::set<Register> &Clique) const {
+  auto &Result = Left;
+  // The set of colors that have been used in the recolored right subgraph
+  std::set<MCRegister> UsedColors;
+  // Colors in the right subgraph that need to be changed
+  std::set<MCRegister> ColorsToChange;
+  std::map<MCRegister, std::shared_ptr<ColoringResult::Color>> ExistingColors;
+  for (auto &[VReg, Color] : Right.RegToColor) {
+    if (Color != nullptr) {
+      ColorsToChange.insert(Color->getPReg());
+    }
+  }
+  for (auto &LColor : Left.Colors) {
+    ExistingColors.insert(std::make_pair(LColor->getPReg(), LColor));
+  }
+  // Registers of the right subgraph that need to be colored
+  std::set<Register> NeedColors;
+  for (auto Node : Clique) {
+    const auto LColor = Left.RegToColor.at(Node);
+    auto RColor = Right.RegToColor.at(Node);
+    if (LColor != nullptr && RColor != nullptr) {
+      // replace rcolor by lcolor in right subgraph
+      auto OldRColor = RColor->getPReg();
+      RColor->setColor(LColor);
+      setColorUsed(*LColor, UsedColors, TRI);
+      ColorsToChange.erase(OldRColor);
+    } else if (LColor != nullptr) {
+      // Node is spilled in right subgraph
+      // Node will be spilled in result
+      // TODO: split live range if node is spilled in one subgraph and colored
+      // in the other
+      Result.RegToColor.insert(std::make_pair(Node, nullptr));
+    } else if (RColor != nullptr) {
+      // Node is spilled in left subgraph
+
+      // we need to recolor the set of nodes in the right subgraph that shared
+      // `Node`'s color
+      NeedColors.insert(Node);
+    }
+  }
+  return recolorRight(ExistingColors, UsedColors, NeedColors, ColorsToChange,
+                      Right, std::move(Result));
+}
+
+std::shared_ptr<ColoringResult::Color> RAParallel::getAvailableColor(
+    Register VReg, MCRegister CurPReg, std::set<MCRegister> &UsedColors,
+    ColoringResult &Result,
+    std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
+        &ExistingColors,
+    bool MustChange) const {
+  if (!MustChange) {
+    // we don't have to change the color
+    if (UsedColors.find(CurPReg) == UsedColors.end()) {
+      return chooseColor(CurPReg, Result, ExistingColors);
+    }
+  }
+  auto Candidates = AllocationOrder::create(VReg, *VRM, RegClassInfo, Matrix);
+  for (auto &[PReg, _] : ExistingColors) {
+    if (orderContainsReg(Candidates, PReg) &&
+        colorIsAvailable(PReg, UsedColors, TRI) &&
+        (!MustChange || CurPReg != PReg)) {
+      return chooseColor(PReg, Result, ExistingColors);
+    }
+  }
+  for (auto PotentialColor : Candidates) {
+    if (colorIsAvailable(PotentialColor, UsedColors, TRI) &&
+        (!MustChange || CurPReg != PotentialColor)) {
+      return chooseColor(PotentialColor, Result, ExistingColors);
+    }
+  }
+  assert(false);
+  return nullptr;
 }
 
 bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
@@ -655,10 +728,16 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
 
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
   const auto G = computeInterference();
-  debugInterferenceGraph(G, TRI, MF->getName().str());
+  if (OutputInterferenceGraph.hasArgStr()) {
+    debugInterferenceGraph(G, TRI, MF->getName().str(),
+                           OutputInterferenceGraph.getValue());
+  }
   const auto T = buildPartitionTree(G, TRI);
-  debugPartitionTree(T, TRI, MF->getName().str());
-  allocPhysRegsTree(T);
+  if (OutputPartitionTree.hasArgStr()) {
+    debugPartitionTree(T, TRI, MF->getName().str(),
+                       OutputPartitionTree.getValue());
+  }
+  allocPhysRegsFinal(colorPhysRegsTree(T));
   postOptimization();
 
   // Diagnostic output before rewriting
@@ -676,37 +755,38 @@ FunctionPass *llvm::createParallelRegisterAllocator(RegClassFilterFunc F) {
   return new RAParallel(F);
 }
 
-void RAParallel::allocPhysRegsTree(const PartitionTree &T) {
+ColoringResult RAParallel::colorPhysRegsTree(const PartitionTree &T) const {
   if (T.Left && T.Right) {
+    assert(T.Regs.empty() && "expected internal node");
     // TODO: spawn task for left subtree
-    allocPhysRegsTree(*T.Left);
-    allocPhysRegsTree(*T.Right);
-    // TODO: merge results
-  } else {
-    assert(!T.Left && !T.Right && "expected leaf node");
-    LLVM_DEBUG(dbgs() << "allocating: ");
-    for (auto &R : T.Regs) {
-      LLVM_DEBUG(dbgs() << printReg(R, TRI) << ", ");
-    }
-    LLVM_DEBUG(dbgs() << "\n");
-    allocPhysRegsPartial(T.Regs);
+    return mergeResults(colorPhysRegsTree(*T.Left), colorPhysRegsTree(*T.Right),
+                        T.SeparatingClique);
   }
+  assert(!T.Left && !T.Right && T.SeparatingClique.empty() &&
+         "expected leaf node");
+  LLVM_DEBUG(dbgs() << "allocating: ");
+  for (auto &[R, _] : T.Regs) {
+    LLVM_DEBUG(dbgs() << printReg(R, TRI) << ", ");
+  }
+  LLVM_DEBUG(dbgs() << "\n");
+  return localColor(T.Regs);
 }
 
-void RAParallel::allocPhysRegsPartial(const std::vector<Register> &VRegs) {
-  for (auto &V : VRegs) {
-    if (MRI->reg_nodbg_empty(V)) {
+void RAParallel::allocPhysRegsFinal(const ColoringResult &Coloring) {
+  for (auto &[Reg, Color] : Coloring.RegToColor) {
+    if (MRI->reg_nodbg_empty(Reg)) {
       continue;
     }
-    enqueue(&LIS->getInterval(V));
+    if (Color != nullptr) {
+      VRM->assignVirt2Phys(Reg, Color->getPReg());
+    } else {
+      enqueue(&LIS->getInterval(Reg));
+    }
   }
 
   // Continue assigning vregs one at a time to available physical registers.
   while (const LiveInterval *VirtReg = dequeue()) {
-    if (VRM->hasPhys(VirtReg->reg())) {
-      // already allocated
-      continue;
-    }
+    assert(!VRM->hasPhys(VirtReg->reg()));
 
     // Unused registers can appear when the spiller coalesces snippets.
     if (MRI->reg_nodbg_empty(VirtReg->reg())) {
