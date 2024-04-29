@@ -5,7 +5,7 @@ command = '''clang++ {filename} -O1 -mllvm -disable-llvm-optzns \
               ../../build/bin/llc --regalloc=parallel | \
               clang++ -no-pie -x assembler - -o a && \
               ./a'''
-output.reg = "-"
+output.txt = "-"
 
 [envs.base]
 command = '''clang++ {filename} -o a2 && ./a2'''
