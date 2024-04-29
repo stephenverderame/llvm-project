@@ -5,7 +5,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#define SMALL_PROBLEM_SIZE
 
 int
 main(int argc, char *argv[]) {

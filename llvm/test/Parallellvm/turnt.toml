@@ -1,5 +1,5 @@
 [envs.reg_alloc]
-command = '''clang++ {filename} -O1 -mllvm -disable-llvm-optzns \
+command = '''clang++ {filename} -D SMALL_PROBLEM_SIZE -O1 -mllvm -disable-llvm-optzns \
                 -S -emit-llvm -o /dev/stdout | \
               ../../build/bin/opt -passes="mem2reg" | \
               ../../build/bin/llc --regalloc=parallel | \
@@ -8,5 +8,5 @@ command = '''clang++ {filename} -O1 -mllvm -disable-llvm-optzns \
 output.txt = "-"
 
 [envs.base]
-command = '''clang++ {filename} -o a2 && ./a2'''
+command = '''clang++ {filename} -O1 -D SMALL_PROBLEM_SIZE -o a2 && ./a2'''
 output.txt = "-"

@@ -4,7 +4,6 @@
 
 #include <iostream>
 #include <stdlib.h>
-#define SMALL_PROBLEM_SIZE
 
 using namespace std;
 
