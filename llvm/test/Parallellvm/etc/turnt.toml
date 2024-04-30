@@ -1,0 +1,11 @@
+[envs.reg_alloc]
+command = '''../../../build/bin/clang++ {filename} -D SMALL_PROBLEM_SIZE -S -emit-llvm \
+             -O1 -mllvm -disable-llvm-optzns -o - | \
+             ../../../build/bin/opt -passes="mem2reg" | \
+             ../../../build/bin/llc --regalloc=parallel | \
+              ../../../build/bin/clang++ -no-pie -x assembler - -o a && ./a'''
+output.txt = "-"
+
+[envs.base]
+command = '''clang++ {filename}  -D SMALL_PROBLEM_SIZE -O1 -o a && ./a'''
+output.txt = "-"

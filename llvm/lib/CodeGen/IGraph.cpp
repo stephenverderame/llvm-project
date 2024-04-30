@@ -158,12 +158,16 @@ PartitionTree llvm::buildPartitionTree(const IGraph &G,
       for (auto &N : Clique) {
         VertexSet.insert(N);
       }
-      // if (VertexSet.size() < GPrime.size()) {
-      Atoms.emplace_back(inducedSubgraph(GPrime, VertexSet));
-      CliqueSeparators.emplace_back(std::move(Clique));
-      GPrime = GPrime - Component;
-      // }
+      if (VertexSet.size() < GPrime.size()) {
+        Atoms.emplace_back(inducedSubgraph(GPrime, VertexSet));
+        CliqueSeparators.emplace_back(std::move(Clique));
+        GPrime = GPrime - Component;
+      }
     }
+  }
+  if (!GPrime.empty()) {
+    Atoms.emplace_back(GPrime);
+    CliqueSeparators.emplace_back(std::set<Register>());
   }
   return partitionTreeFromAtoms(std::move(Atoms), CliqueSeparators);
 }
