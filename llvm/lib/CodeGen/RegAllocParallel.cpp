@@ -150,8 +150,8 @@ struct ColoringResult {
     void setColor(const std::shared_ptr<Color> &C) {
       auto *Root = getRootMut();
       if (Root != C->getRootMut()) {
-        auto &Class = std::get<ColorClass>(Root->Value);
-        C->addMembers(Class.Members);
+        auto &CurClass = std::get<ColorClass>(Root->Value);
+        C->addMembers(CurClass.Members);
         Root->Value = C;
         Value = C;
       }
@@ -291,7 +291,7 @@ class RAParallel : public MachineFunctionPass,
   [[nodiscard]] std::shared_ptr<ColoringResult::Color> getAvailableColor(
       Register VReg,
       const std::shared_ptr<ColoringResult::Color> &RightColorClass,
-      const std::set<MCRegister> &UsedColors, ColoringResult &Result,
+      const std::set<MCRegUnit> &UsedColors, ColoringResult &Result,
       std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
           &ExistingColors,
       bool MustChange = false) const;
@@ -304,7 +304,7 @@ class RAParallel : public MachineFunctionPass,
   /// resulting coloring. Updated with new colors as they are added.
   /// @param UsedColors A set of physical registers that have been used in the
   /// coloring.
-  /// @param NeedColors A set of registers in the right subgraph that need their
+  /// @param NeedColors A set of colors in the right subgraph that need their
   /// color changed.
   /// @param ColorsToChange A set of colors in the right subgraph that need to
   /// be changed.
@@ -315,7 +315,8 @@ class RAParallel : public MachineFunctionPass,
   ColoringResult recolorRight(
       std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
           &ExistingColors,
-      std::set<MCRegister> &UsedColors, std::set<Register> &NeedColors,
+      std::set<MCRegUnit> &UsedColors,
+      std::set<std::shared_ptr<ColoringResult::Color>> &NeedColors,
       std::unordered_set<const ColoringResult::Color *> &ColorsToChange,
       ColoringResult &Right, ColoringResult &&Result) const;
 
@@ -695,12 +696,17 @@ ColoringResult RAParallel::localColor(const IGraph &G) const {
 }
 
 /// Marks `C` and all its register units as used in `UsedColors`.
-void setColorUsed(ColoringResult::Color &C, std::set<MCRegister> &UsedColors,
+void setColorUsed(ColoringResult::Color &C, std::set<MCRegUnit> &UsedColors,
                   const TargetRegisterInfo *TRI) {
-  UsedColors.insert(C.getPReg());
+  // UsedColors.insert(C.getPReg());
   for (auto Unit : TRI->regunits(C.getPReg())) {
     UsedColors.insert(Unit);
   }
+  LLVM_DEBUG(
+      dbgs() << "Adding " << printReg(C.getPReg(), TRI) << " UsedColors [ ";
+      for (auto Unit
+           : UsedColors) { dbgs() << printRegUnit(Unit, TRI) << " "; } dbgs()
+      << "]\n";);
 }
 
 /// Returns true if `Color` is available in `UsedColors`. Checks for
@@ -708,7 +714,7 @@ void setColorUsed(ColoringResult::Color &C, std::set<MCRegister> &UsedColors,
 /// available.
 [[nodiscard]] bool colorIsAvailable(MCRegister Color,
                                     const ColoringResult::Color &CurColorClass,
-                                    const std::set<MCRegister> &UsedColors,
+                                    const std::set<MCRegUnit> &UsedColors,
                                     const TargetRegisterInfo *TRI,
                                     LiveRegMatrix *Matrix,
                                     const LiveIntervals *LIS) {
@@ -720,10 +726,6 @@ void setColorUsed(ColoringResult::Color &C, std::set<MCRegister> &UsedColors,
       // a member interferes with precolored registers
       return false;
     }
-  }
-  if (UsedColors.find(Color) != UsedColors.end()) {
-    // UsedColors contains the color
-    return false;
   }
   for (auto Unit : TRI->regunits(Color)) {
     if (UsedColors.find(Unit) != UsedColors.end()) {
@@ -780,18 +782,19 @@ void RAParallel::recolorAliases(
 ColoringResult RAParallel::recolorRight(
     std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
         &ExistingColors,
-    std::set<MCRegister> &UsedColors, std::set<Register> &NeedColors,
+    std::set<MCRegUnit> &UsedColors,
+    std::set<std::shared_ptr<ColoringResult::Color>> &NeedColors,
     std::unordered_set<const ColoringResult::Color *> &ColorsToChange,
     ColoringResult &Right, ColoringResult &&Result) const {
   // for nodes in the clique that need colors in the right subgraph
-  for (auto &Node : NeedColors) {
+  for (auto &NodeColor : NeedColors) {
     // node is spilled in the left subgraph but not the right subgraph
-    auto NodeColor = Right.RegToColor.at(Node);
     if (ColorsToChange.find(NodeColor->getRoot()) != ColorsToChange.end() &&
         !NodeColor->members().empty()) {
       // we must change the color
-      auto NewColor = getAvailableColor(Node, NodeColor, UsedColors, Result,
-                                        ExistingColors, true);
+      auto NewColor =
+          getAvailableColor(*NodeColor->members().begin(), NodeColor,
+                            UsedColors, Result, ExistingColors, true);
       assert(NewColor != nullptr);
       assert(NewColor->getPReg() != NodeColor->getPReg());
       setColorUsed(*NewColor, UsedColors, TRI);
@@ -835,7 +838,7 @@ ColoringResult RAParallel::recolorRight(
       auto OldPReg = Color->getPReg();
       Color->setColor(NewColor);
       recolorAliases(Right, OldPReg, *Color, ExistingColors, ColorsToChange);
-      setColorUsed(*Color, UsedColors, TRI);
+      setColorUsed(*NewColor, UsedColors, TRI);
     }
   }
   return Result;
@@ -853,7 +856,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
   } dbgs() << "}\n";);
   auto &Result = Left;
   // The set of colors that have been used in the recolored right subgraph
-  std::set<MCRegister> UsedColors;
+  std::set<MCRegUnit> UsedColors;
   // Colors in the right subgraph that need to be changed
   std::unordered_set<const ColoringResult::Color *> ColorsToChange;
   std::map<MCRegister, std::shared_ptr<ColoringResult::Color>> ExistingColors;
@@ -869,11 +872,13 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
     }
   }
   // Registers of the right subgraph that need to be colored
-  std::set<Register> NeedColors;
+  std::set<std::shared_ptr<ColoringResult::Color>> NeedColors;
   for (auto Node : Clique) {
     const auto LColor = Left.RegToColor.at(Node);
     auto RColor = Right.RegToColor.at(Node);
     if (LColor != nullptr && RColor != nullptr) {
+      // two nodes in the clique cannot have the same color
+      assert(ColorsToChange.find(RColor->getRoot()) != ColorsToChange.end());
       // replace rcolor by lcolor in right subgraph
       auto OldRColor = RColor->getPReg();
       ColorsToChange.erase(RColor->getRoot());
@@ -890,24 +895,35 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
     } else if (LColor != nullptr) {
       // Node is spilled in right subgraph but colored in the left
 
-      // Node will be spilled in result
+      // Node needs to be spilled in result
       // TODO: split live range if node is spilled in one subgraph and colored
       // in the other
       Result.RegToColor.at(Node)->members().erase(Node);
       Result.RegToColor[Node] = nullptr;
+      LLVM_DEBUG(dbgs() << "Spilling " << printReg(Node, TRI)
+                        << " from left\n";);
     } else if (RColor != nullptr) {
+      assert(ColorsToChange.find(RColor->getRoot()) != ColorsToChange.end());
       // Node is spilled in left subgraph, but colored in the right
+      Right.RegToColor.at(Node)->members().erase(Node);
+      Right.RegToColor[Node] = nullptr;
+      LLVM_DEBUG(dbgs() << "Spilling " << printReg(Node, TRI)
+                        << " from right\n";);
 
-      if (RColor->members().size() > 1) {
-        // we need to recolor the set of nodes in the right subgraph that shared
-        // `Node`'s color
-        NeedColors.insert(Node);
+      if (!RColor->members().empty()) {
+        // if there are other nodes in the right subgraph with the same color,
+        // we need to recolor them
+        NeedColors.insert(ColoringResult::Color::getRootPtr(RColor));
       } else {
         // no other reg has this color, so it's free to use
         ColorsToChange.erase(RColor->getRoot());
       }
     }
   }
+  LLVM_DEBUG(dbgs() << "Colors To Change: [ "; for (auto &Color
+                                                    : ColorsToChange) {
+    dbgs() << printReg(Color->getPReg(), TRI) << " ";
+  } dbgs() << "]\n");
   auto Res = recolorRight(ExistingColors, UsedColors, NeedColors,
                           ColorsToChange, Right, std::move(Result));
   LLVM_DEBUG(Res.print(dbgs() << "====\n", TRI) << "\n\n");
@@ -917,7 +933,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
 std::shared_ptr<ColoringResult::Color> RAParallel::getAvailableColor(
     Register VReg,
     const std::shared_ptr<ColoringResult::Color> &RightColorClass,
-    const std::set<MCRegister> &UsedColors, ColoringResult &Result,
+    const std::set<MCRegUnit> &UsedColors, ColoringResult &Result,
     std::map<MCRegister, std::shared_ptr<ColoringResult::Color>>
         &ExistingColors,
     bool MustChange) const {
@@ -955,7 +971,11 @@ std::shared_ptr<ColoringResult::Color> RAParallel::getAvailableColor(
       << "} out of [ ";
       for (auto PReg
            : Candidates) { dbgs() << printReg(PReg, TRI) << " "; } dbgs()
-      << "]\n";);
+      << "]\n";
+      dbgs() << "Used colors: [ "; for (auto &Color
+                                        : UsedColors) {
+        dbgs() << printReg(Color, TRI) << " ";
+      } dbgs() << "]\n";);
   assert(false);
   return nullptr;
 }
