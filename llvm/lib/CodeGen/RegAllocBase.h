@@ -47,7 +47,7 @@ class LiveIntervals;
 class LiveRegMatrix;
 class MachineInstr;
 class MachineRegisterInfo;
-template<typename T> class SmallVectorImpl;
+template <typename T> class SmallVectorImpl;
 class Spiller;
 class TargetRegisterInfo;
 class VirtRegMap;
@@ -76,8 +76,8 @@ protected:
   /// always available for the remat of all the siblings of the original reg.
   SmallPtrSet<MachineInstr *, 32> DeadRemats;
 
-  RegAllocBase(const RegClassFilterFunc F = allocateAllRegClasses) :
-    ShouldAllocateClass(F) {}
+  RegAllocBase(const RegClassFilterFunc F = allocateAllRegClasses)
+      : ShouldAllocateClass(F) {}
 
   virtual ~RegAllocBase() = default;
 
@@ -123,7 +123,7 @@ public:
   static bool VerifyEnabled;
 
 private:
-  void seedLiveRegs();
+  virtual void seedLiveRegs();
 };
 
 } // end namespace llvm

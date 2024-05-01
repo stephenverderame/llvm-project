@@ -1,4 +1,7 @@
 #include "IGraph.hpp"
+#include "AllocationOrder.h"
+#include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/Support/Debug.h"
@@ -262,4 +265,136 @@ void llvm::debugPartitionTree(const PartitionTree &T,
   Out.flush();
   std::ofstream OutFile(FuncName + "_" + FileName);
   OutFile << OutTxt << std::endl;
+}
+
+llvm::PRegMap::PRegMap(const IGraph &G, const VirtRegMap &VRM,
+                       const RegisterClassInfo &RegClassInfo,
+                       LiveRegMatrix *Matrix, const LiveIntervals *LIS) {
+  for (auto &[VReg, _] : G) {
+    auto Order = AllocationOrder::create(VReg, VRM, RegClassInfo, Matrix);
+    std::vector<MCRegister> CorrectedOrder;
+    for (auto PReg : Order) {
+      if (Matrix->checkInterference(LIS->getInterval(VReg), PReg) ==
+          LiveRegMatrix::IK_Free) {
+        CorrectedOrder.push_back(PReg);
+      }
+    }
+    OrderMap[VReg] = CorrectedOrder;
+    SetMap[VReg] =
+        std::set<MCRegister>(CorrectedOrder.begin(), CorrectedOrder.end());
+  }
+}
+
+bool llvm::PRegMap::isValidAssignment(Register VReg, MCRegister PReg) const {
+  return SetMap.at(VReg).find(PReg) != SetMap.at(VReg).end();
+}
+
+const std::vector<MCRegister> &
+llvm::PRegMap::getAllocationOrder(Register VReg) const {
+  return OrderMap.at(VReg);
+}
+
+std::shared_ptr<Color> llvm::Color::getRootHelper() const {
+  auto Parent = std::get<std::shared_ptr<Color>>(Value);
+  return std::visit(
+      [Parent](auto &&Val) {
+        using T = std::decay_t<decltype(Val)>;
+        if constexpr (std::is_same_v<ColorClass, T>) {
+          return Parent;
+        } else {
+          return Parent->getRootHelper();
+        }
+      },
+      Parent->Value);
+}
+
+Color *llvm::Color::getRootMut() {
+  return std::visit(
+      [this](auto &&V) {
+        using T = std::decay_t<decltype(V)>;
+        if constexpr (std::is_same_v<ColorClass, T>) {
+          return this;
+        } else {
+          return V->getRootMut();
+        }
+      },
+      Value);
+}
+
+void llvm::Color::addMembers(const std::set<Register> &Members) {
+  auto *Root = getRootMut();
+  auto &Class = std::get<ColorClass>(Root->Value);
+  Class.Members.insert(Members.begin(), Members.end());
+}
+
+MCRegister llvm::Color::getPReg() {
+  if (std::holds_alternative<ColorClass>(Value)) {
+    return std::get<ColorClass>(Value).PReg;
+  }
+  Value = getRootHelper();
+  auto Ptr = std::get<std::shared_ptr<Color>>(Value);
+  assert(Ptr != nullptr);
+  return Ptr->getPReg();
+}
+
+MCRegister llvm::Color::getPReg() const {
+  if (std::holds_alternative<ColorClass>(Value)) {
+    return std::get<ColorClass>(Value).PReg;
+  }
+  return std::get<std::shared_ptr<Color>>(Value)->getPReg();
+}
+
+void llvm::Color::setColor(const std::shared_ptr<Color> &C) {
+  auto *Root = getRootMut();
+  if (Root != C->getRootMut()) {
+    auto &CurClass = std::get<ColorClass>(Root->Value);
+    C->addMembers(CurClass.Members);
+    Root->Value = C;
+    Value = C;
+  }
+}
+
+void llvm::Color::setColor(std::shared_ptr<Color> &&C) { setColor(C); }
+
+const Color *Color::getRoot() const {
+  return std::visit(
+      [this](auto &&V) -> const Color * {
+        using T = std::decay_t<decltype(V)>;
+        if constexpr (std::is_same_v<ColorClass, T>) {
+          return this;
+        } else {
+          return V->getRoot();
+        }
+      },
+      Value);
+}
+
+std::shared_ptr<Color> Color::getRootPtr(const std::shared_ptr<Color> &C) {
+  return std::visit(
+      [C](auto &&V) -> std::shared_ptr<Color> {
+        using T = std::decay_t<decltype(V)>;
+        if constexpr (std::is_same_v<ColorClass, T>) {
+          return C;
+        } else {
+          return V->getRootPtr(C);
+        }
+      },
+      C->Value);
+}
+
+raw_ostream &ColoringResult::print(raw_ostream &OS,
+                                   const TargetRegisterInfo *TRI) const {
+  for (auto &[Reg, Color] : RegToColor) {
+    OS << printReg(Reg, TRI) << " -> ";
+    if (Color == nullptr) {
+      OS << "Spilled\n";
+    } else {
+      OS << printReg(Color->getPReg(), TRI) << "\t\t(";
+      for (auto Unit : TRI->regunits(Color->getPReg())) {
+        OS << printRegUnit(Unit, TRI) << ", ";
+      }
+      OS << ")\n";
+    }
+  }
+  return OS;
 }
