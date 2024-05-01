@@ -43,6 +43,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <numeric>
@@ -195,14 +196,15 @@ class RAParallel : public MachineFunctionPass,
   /// Allocates physical registers and handles spills for a coloring result.
   void setupAllocation(const ColoringResult &Coloring);
   /// Recursively builds a coloring result from a partition tree.
-  [[nodiscard]] ColoringResult colorPhysRegsTree(const PartitionTree &T,
+  [[nodiscard]] ColoringResult colorPhysRegsTree(const PartitionTree *T,
                                                  const PRegMap &M) const;
 
   /// Performs register allocation on a leaf node of the partition tree
-  [[nodiscard]] ColoringResult localColor(const IGraph &G) const;
+  [[nodiscard]] ColoringResult localColor(const IGraph &G,
+                                          const PRegMap &M) const;
   /// Returns true if `VReg` interferes with `PReg` given the current
   /// interference graph and coloring.
-  [[nodiscard]] bool doesInterfere(const IGraph &G,
+  [[nodiscard]] bool doesInterfere(const IGraph &G, const PRegMap &M,
                                    const ColoringResult &CurColoring,
                                    Register VReg, MCRegister PReg) const;
   /// Merges two coloring results together of sibilings in the partition tree
@@ -524,7 +526,7 @@ IGraph RAParallel::computeInterference() {
             }
           }
         dbl_break:
-          // NOLINTNEXTLINE
+          (void)G;
         } else {
           G[Reg].insert(Reg2);
           G[Reg2].insert(Reg);
@@ -535,11 +537,10 @@ IGraph RAParallel::computeInterference() {
   return G;
 }
 
-bool RAParallel::doesInterfere(const IGraph &G,
+bool RAParallel::doesInterfere(const IGraph &G, const PRegMap &M,
                                const ColoringResult &CurColoring, Register VReg,
                                MCRegister PReg) const {
-  if (Matrix->checkInterference(LIS->getInterval(VReg), PReg) !=
-      LiveRegMatrix::IK_Free) {
+  if (!M.isValidAssignment(VReg, PReg)) {
     return true;
   }
   for (auto Neighbor : G.at(VReg)) {
@@ -555,7 +556,7 @@ bool RAParallel::doesInterfere(const IGraph &G,
   return false;
 }
 
-ColoringResult RAParallel::localColor(const IGraph &G) const {
+ColoringResult RAParallel::localColor(const IGraph &G, const PRegMap &M) const {
   // TODO: better coloring algorithm instead of greedy coloring.
   ColoringResult Result;
   std::vector<std::pair<Register, float>> RegHeap;
@@ -578,7 +579,7 @@ ColoringResult RAParallel::localColor(const IGraph &G) const {
         AllocationOrder::create(VReg, *VRM, RegClassInfo, Matrix);
     bool Colored = false;
     for (auto PReg : PRegs) {
-      if (!doesInterfere(G, Result, VReg, PReg)) {
+      if (!doesInterfere(G, M, Result, VReg, PReg)) {
         // if we have an available color, assign it, otherwise
         Colored = true;
         Result.RegToColor[VReg] = chooseColor(PReg, UsedColors, VReg);
@@ -859,7 +860,12 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
     debugPartitionTree(T, TRI, MF->getName().str(),
                        OutputPartitionTree.getValue());
   }
-  auto Coloring = colorPhysRegsTree(T, PregMap);
+  ColoringResult Coloring;
+#pragma omp parallel default(shared)
+  {
+#pragma omp single
+    Coloring = colorPhysRegsTree(&T, PregMap);
+  }
   setupAllocation(Coloring);
   allocatePhysRegs();
   postOptimization();
@@ -879,22 +885,24 @@ FunctionPass *llvm::createParallelRegisterAllocator(RegClassFilterFunc F) {
   return new RAParallel(F);
 }
 
-ColoringResult RAParallel::colorPhysRegsTree(const PartitionTree &T,
+ColoringResult RAParallel::colorPhysRegsTree(const PartitionTree *T,
                                              const PRegMap &G) const {
-  if (T.Left && T.Right) {
-    assert(T.Regs.empty() && "expected internal node");
-    // TODO: spawn task for left subtree
-    auto L = colorPhysRegsTree(*T.Left, G);
-    auto R = colorPhysRegsTree(*T.Right, G);
-    return mergeResults(std::move(L), std::move(R), T.SeparatingClique, G);
+  if (T->Left && T->Right) {
+    assert(T->Regs.empty() && "expected internal node");
+    ColoringResult L;
+#pragma omp task shared(L)
+    L = colorPhysRegsTree(T->Left.get(), G);
+    auto R = colorPhysRegsTree(T->Right.get(), G);
+#pragma omp taskwait
+    return mergeResults(std::move(L), std::move(R), T->SeparatingClique, G);
   }
-  assert(!T.Left && !T.Right && T.SeparatingClique.empty() &&
+  assert(!T->Left && !T->Right && T->SeparatingClique.empty() &&
          "expected leaf node");
   LLVM_DEBUG(dbgs() << "++ ALLOCATING: "; for (auto &[R, _]
-                                               : T.Regs) {
+                                               : T->Regs) {
     dbgs() << printReg(R, TRI) << ", ";
   } dbgs() << "++\n");
-  return localColor(T.Regs);
+  return localColor(T->Regs, G);
 }
 
 void RAParallel::setupAllocation(const ColoringResult &Coloring) {

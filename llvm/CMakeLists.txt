@@ -2,7 +2,8 @@
 
 cmake_minimum_required(VERSION 3.20.0)
 set(EXPORT_COMPILE_COMMANDS ON)
-add_link_options("-fuse-ld=lld")
+# add_link_options("-fuse-ld=lld")
+
 
 set(LLVM_COMMON_CMAKE_UTILS ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
 include(${LLVM_COMMON_CMAKE_UTILS}/Modules/CMakePolicy.cmake
@@ -47,6 +48,9 @@ endif()
 project(LLVM
   VERSION ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH}
   LANGUAGES C CXX ASM)
+
+find_package(OpenMP REQUIRED)
+link_libraries(OpenMP::OpenMP_CXX)
 
 if (NOT DEFINED CMAKE_INSTALL_LIBDIR AND DEFINED LLVM_LIBDIR_SUFFIX)
   # Must go before `include(GNUInstallDirs)`.
