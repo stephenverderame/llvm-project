@@ -30,6 +30,7 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
@@ -37,6 +38,7 @@
 #include "llvm/CodeGen/Spiller.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/MC/MCRegister.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
@@ -48,6 +50,7 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -67,7 +70,11 @@ static cl::opt<std::string>
     OutputPartitionTree("debug-partitions",
                         cl::desc("Specify file to write partition tree to"),
                         cl::value_desc("filename"));
-
+static cl::opt<std::string>
+    OutputOnly("debug-func",
+               cl::desc("Specify a comma separated list of "
+                        "functions to save debug output for"),
+               cl::value_desc("function1,function2,..."));
 namespace {
 struct CompSpillWeight {
   bool operator()(const LiveInterval *A, const LiveInterval *B) const {
@@ -210,10 +217,10 @@ class RAParallel : public MachineFunctionPass,
   /// Merges two coloring results together of sibilings in the partition tree
   /// Requires that the only shared virtual registers between the two coloring
   /// results are in the clique.
-  [[nodiscard]] ColoringResult mergeResults(ColoringResult &&A,
-                                            ColoringResult &&B,
-                                            const std::set<Register> &Clique,
-                                            const PRegMap &G) const;
+  [[nodiscard]] ColoringResult
+  mergeResults(ColoringResult &&A, ColoringResult &&B,
+               const std::unordered_set<Register> &Clique,
+               const PRegMap &G) const;
 
   /// Gets an available color for `NodePReg` from `AvailableColors`. If
   /// `MustChange` is true, the color must be different from `CurPReg`. If the
@@ -308,6 +315,59 @@ public:
 };
 
 char RAParallel::ID = 0;
+
+inline void ltrim(std::string &S) {
+  S.erase(S.begin(), std::find_if(S.begin(), S.end(), [](unsigned char C) {
+            return !std::isspace(C);
+          }));
+}
+
+// trim from end (in place)
+inline void rtrim(std::string &S) {
+  S.erase(std::find_if(S.rbegin(), S.rend(),
+                       [](unsigned char C) { return !std::isspace(C); })
+              .base(),
+          S.end());
+}
+
+/// Returns true if `Name` matches `Pattern`. `Pattern` can contain a `*` at the
+/// end to match any substring.
+[[nodiscard]] bool matches(const std::string &Name,
+                           const std::string &Pattern) {
+  return Pattern == Name ||
+         (Pattern.find('*') != std::string::npos &&
+          Name.find(Pattern.substr(0, Pattern.find('*'))) == 0);
+}
+
+// Determines whether we should output graphs for `FuncName` based on the
+// `OutputOnly`
+bool canDebug(const StringRef &FuncName) {
+  if (OutputOnly.hasArgStr()) {
+    auto Trimmed = OutputOnly.getValue();
+    ltrim(Trimmed);
+    rtrim(Trimmed);
+    if (Trimmed.empty()) {
+      return true;
+    }
+    std::istringstream Iss(OutputOnly.getValue());
+    const auto Name = demangle(FuncName);
+    std::string Opt;
+    while (std::getline(Iss, Opt, ',')) {
+      if (!Opt.empty()) {
+        if (Opt[0] == '-') {
+          const auto OptName = Opt.substr(1);
+          if (matches(Name, OptName)) {
+            return false;
+          }
+        } else if (matches(Name, Opt)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  return true;
+}
 
 } // end anonymous namespace
 
@@ -503,16 +563,16 @@ IGraph RAParallel::computeInterference() {
       }
       if (Reg == Reg2) {
         if (G.find(Reg) == G.end()) {
-          G.insert(std::make_pair(Reg, std::set<Register>()));
+          G.insert(std::make_pair(Reg, std::unordered_set<Register>()));
         }
         continue;
       }
       if (LIS->getInterval(Reg).overlaps(LIS->getInterval(Reg2))) {
         if (G.find(Reg) == G.end()) {
-          G.insert(std::make_pair(Reg, std::set<Register>()));
+          G.insert(std::make_pair(Reg, std::unordered_set<Register>()));
         }
         if (G.find(Reg2) == G.end()) {
-          G.insert(std::make_pair(Reg2, std::set<Register>()));
+          G.insert(std::make_pair(Reg2, std::unordered_set<Register>()));
         }
         if (LIS->getInterval(Reg).hasSubRanges() &&
             LIS->getInterval(Reg2).hasSubRanges()) {
@@ -575,8 +635,7 @@ ColoringResult RAParallel::localColor(const IGraph &G, const PRegMap &M) const {
     std::pop_heap(RegHeap.begin(), RegHeap.end(), Cmp);
     auto [VReg, _] = RegHeap.back();
     RegHeap.pop_back();
-    const auto PRegs =
-        AllocationOrder::create(VReg, *VRM, RegClassInfo, Matrix);
+    const auto &PRegs = M.getAllocationOrder(VReg);
     bool Colored = false;
     for (auto PReg : PRegs) {
       if (!doesInterfere(G, M, Result, VReg, PReg)) {
@@ -712,10 +771,10 @@ ColoringResult RAParallel::recolorRight(MergeCtx &Ctx, const PRegMap &M,
   return Result;
 }
 
-ColoringResult RAParallel::mergeResults(ColoringResult &&Left,
-                                        ColoringResult &&Right,
-                                        const std::set<Register> &Clique,
-                                        const PRegMap &M) const {
+ColoringResult
+RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
+                         const std::unordered_set<Register> &Clique,
+                         const PRegMap &M) const {
   LLVM_DEBUG(dbgs() << "*** Merging ***\n");
   LLVM_DEBUG(Left.print(dbgs(), TRI) << "with\n");
   LLVM_DEBUG(Right.print(dbgs(), TRI));
@@ -851,15 +910,19 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
   const auto G = computeInterference();
   const auto PregMap = PRegMap{G, *VRM, RegClassInfo, Matrix, LIS};
-  if (OutputInterferenceGraph.hasArgStr()) {
-    debugInterferenceGraph(G, TRI, MF->getName().str(),
-                           OutputInterferenceGraph.getValue());
-  }
+  LLVM_DEBUG(if (canDebug(Mf.getName())) {
+    if (OutputInterferenceGraph.hasArgStr()) {
+      debugInterferenceGraph(G, TRI, demangle(MF->getName()),
+                             OutputInterferenceGraph.getValue());
+    }
+  });
   const auto T = buildPartitionTree(G, TRI);
-  if (OutputPartitionTree.hasArgStr()) {
-    debugPartitionTree(T, TRI, MF->getName().str(),
-                       OutputPartitionTree.getValue());
-  }
+  LLVM_DEBUG(if (canDebug(Mf.getName())) {
+    if (OutputPartitionTree.hasArgStr()) {
+      debugPartitionTree(T, TRI, demangle(MF->getName()),
+                         OutputPartitionTree.getValue());
+    }
+  });
   ColoringResult Coloring;
 #pragma omp parallel default(shared)
   {

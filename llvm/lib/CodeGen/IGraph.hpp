@@ -8,9 +8,24 @@
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
+
+namespace std {
+template <> struct hash<llvm::Register> {
+  std::size_t operator()(const llvm::Register &R) const {
+    return std::hash<unsigned>()(R.id());
+  }
+};
+
+template <> struct hash<llvm::MCRegister> {
+  std::size_t operator()(const llvm::MCRegister &R) const {
+    return std::hash<unsigned>()(R.id());
+  }
+};
+} // namespace std
 namespace llvm {
-using IGraph = std::map<Register, std::set<Register>>;
+using IGraph = std::unordered_map<Register, std::unordered_set<Register>>;
 
 /// A partition tree is a binary tree that represents a partition of a set of
 /// registers. Each leaf node contains a set of registers, and each internal
@@ -18,26 +33,9 @@ using IGraph = std::map<Register, std::set<Register>>;
 struct PartitionTree {
   /// Invariant: Either has both children and no regs or is a leaf and has regs.
   std::unique_ptr<PartitionTree> Left, Right;
-  std::set<Register> SeparatingClique;
+  std::unordered_set<Register> SeparatingClique;
   IGraph Regs;
 };
-/// Gets a perfect (simplicial) elimination order of the interference graph G.
-std::vector<Register> perfectElimOrder(const IGraph &G);
-
-/// Returns true if Clique is a complete subgraph of G.
-bool isCompleteSubgraph(const IGraph &G, const std::set<Register> &Clique);
-
-/// Gets the connected component of G containing X, excluding the registers in
-/// Exclude.
-std::set<Register> connectedComponent(const IGraph &G,
-                                      const std::set<Register> &Exclude,
-                                      Register X);
-
-/// Returns the induced subgraph of Set in G.
-IGraph inducedSubgraph(const IGraph &G, std::set<Register> &Set);
-
-/// Removes the nodes of S from G.
-IGraph operator-(const IGraph &G, const std::set<Register> &S);
 
 /// Builds a partition tree from the interference graph G.
 /// G is assumed to be chordal, however if it is not, the algorithm will still
@@ -59,8 +57,8 @@ void debugPartitionTree(const PartitionTree &T, const TargetRegisterInfo *TRI,
 /// The graph is bipartite with bipartite sets for virtual and physical
 /// registers.
 class PRegMap {
-  std::map<Register, std::vector<MCRegister>> OrderMap;
-  std::map<Register, std::set<MCRegister>> SetMap;
+  std::unordered_map<Register, std::vector<MCRegister>> OrderMap;
+  std::unordered_map<Register, std::unordered_set<MCRegister>> SetMap;
 
 public:
   /// For each register in the interference graph, returns a list of physical
@@ -86,7 +84,7 @@ class Color {
   /// The root node of the union-find data structure.
   struct ColorClass {
     MCRegister PReg;
-    std::set<Register> Members;
+    std::unordered_set<Register> Members;
   };
   // Physical register or parent
   std::variant<ColorClass, std::shared_ptr<Color>> Value;
@@ -100,7 +98,7 @@ private:
   Color *getRootMut();
 
   /// Adds the members to the color class this node represents
-  void addMembers(const std::set<Register> &Members);
+  void addMembers(const std::unordered_set<Register> &Members);
 
 public:
   /// Gets the physical register for this color
@@ -118,21 +116,22 @@ public:
 
   Color(std::shared_ptr<Color> Value) : Value(std::move(Value)) {}
   Color(MCRegister PReq, Register VReg) {
-    std::set<Register> Members;
+    std::unordered_set<Register> Members;
     Members.insert(VReg);
     Value = ColorClass{PReq, Members};
   }
-  Color(MCRegister PReq) : Value(ColorClass{PReq, std::set<Register>()}) {}
+  Color(MCRegister PReq)
+      : Value(ColorClass{PReq, std::unordered_set<Register>()}) {}
 
   /// Gets the root color of the equivalence class this node is in
   const Color *getRoot() const;
 
-  inline const std::set<Register> &members() const {
+  inline const std::unordered_set<Register> &members() const {
     auto *Root = getRoot();
     return std::get<ColorClass>(Root->Value).Members;
   }
 
-  inline std::set<Register> &members() {
+  inline std::unordered_set<Register> &members() {
     auto *Root = getRootMut();
     return std::get<ColorClass>(Root->Value).Members;
   }

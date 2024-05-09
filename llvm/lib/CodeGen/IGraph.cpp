@@ -1,25 +1,45 @@
-#include "IGraph.hpp"
+#include "llvm/CodeGen/LiveInterval.h"
+#include "llvm/CodeGen/LiveVariables.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachinePostDominators.h"
+#include <queue>
+#define DEBUG_TYPE "regalloc"
 #include "AllocationOrder.h"
+#include "IGraph.hpp"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <fstream>
-#define DEBUG_TYPE "igraph"
+#include <stack>
+#include <unordered_set>
 
 using namespace llvm;
-std::vector<Register> llvm::perfectElimOrder(const IGraph &G) {
+
+namespace {
+/// Computes a perfect elimination order for the interference graph `G`.
+/// @return a pair of the perfect elimination order and the set of vertices
+/// that are separator generators.
+std::pair<std::vector<Register>, std::unordered_set<Register>>
+perfectElimOrder(const IGraph &G) {
   // maximum cardinality search, generates a perfect elimination order bc
   // ssa interference graphs are chordal
   std::vector<Register> Order;
   std::vector<std::pair<Register, int>> Heap;
-  std::map<Register, int> Weights;
-  std::set<Register> Numbered;
+  std::unordered_map<Register, int> Weights;
+  // the set of registers that have already been placed in the order.
+  // during the loop, for a given register, the set of numbered registers will
+  // come after it in the elimination order
+  std::unordered_set<Register> Numbered;
+  std::unordered_set<Register> SeparatorGenerators;
   for (auto [V, _] : G) {
-    Heap.push_back(std::make_pair(V, 0));
-    Weights.insert(std::make_pair(V, 0));
+    Heap.emplace_back(std::make_pair(V, 0));
+    Weights[V] = 0;
   }
   Order.resize(G.size());
   const auto Comp = [](const std::pair<Register, int> &A,
@@ -27,16 +47,26 @@ std::vector<Register> llvm::perfectElimOrder(const IGraph &G) {
     return A.second < B.second;
   };
   int N = G.size() - 1;
+  int LastWeight = -1;
   while (!Heap.empty()) {
     std::pop_heap(Heap.begin(), Heap.end(), Comp);
-    auto [V, W] = Heap.back();
+    const auto [V, W] = Heap.back();
     Heap.pop_back();
     if (Numbered.find(V) != Numbered.end()) {
       continue;
     }
     Numbered.insert(V);
     Order[N--] = V;
-    for (auto U : G.at(V)) {
+    if (W <= LastWeight) {
+      // if W is less than or equal to the last weight, then V must be in a new
+      // component since each vertex in the previous component will be
+      // incremented by 1
+      SeparatorGenerators.insert(V);
+      // the separator generator will be the first vertex in the elimination
+      // order in each clique separator
+    }
+    LastWeight = W;
+    for (const auto U : G.at(V)) {
       if (Numbered.find(U) != Numbered.end()) {
         continue;
       }
@@ -45,11 +75,30 @@ std::vector<Register> llvm::perfectElimOrder(const IGraph &G) {
       std::push_heap(Heap.begin(), Heap.end(), Comp);
     }
   }
-  return Order;
+  return {Order, SeparatorGenerators};
 }
 
-bool llvm::isCompleteSubgraph(const IGraph &G,
-                              const std::set<Register> &Clique) {
+/// Returns the set of neighbors of `V` in `G` that are also in `ValidVertices`.
+/// If `IncludeV` is true, `V` will be included in the set of neighbors,
+/// regardless of whether it is in `ValidVertices`. Otherwise, `V` will never
+/// be included in the set of neighbors.
+std::unordered_set<Register>
+neighbors(const IGraph &G, const std::unordered_set<Register> &ValidVertices,
+          const Register V, bool IncludeV = false) {
+  std::unordered_set<Register> Neighbors;
+  for (auto U : G.at(V)) {
+    if (ValidVertices.find(U) != ValidVertices.end()) {
+      Neighbors.insert(U);
+    }
+  }
+  if (IncludeV) {
+    Neighbors.insert(V);
+  }
+  return Neighbors;
+}
+
+bool isCompleteSubgraph(const IGraph &G,
+                        const std::unordered_set<Register> &Clique) {
   for (auto V : Clique) {
     for (auto U : Clique) {
       if (V == U) {
@@ -63,10 +112,10 @@ bool llvm::isCompleteSubgraph(const IGraph &G,
   return true;
 }
 
-std::set<Register> llvm::connectedComponent(const IGraph &G,
-                                            const std::set<Register> &Exclude,
-                                            Register X) {
-  std::set<Register> Component;
+std::unordered_set<Register>
+connectedComponent(const IGraph &G, const std::unordered_set<Register> &Exclude,
+                   Register X) {
+  std::unordered_set<Register> Component;
   std::queue<Register> Q;
   Q.push(X);
   while (!Q.empty()) {
@@ -84,10 +133,11 @@ std::set<Register> llvm::connectedComponent(const IGraph &G,
   return Component;
 }
 
-IGraph llvm::inducedSubgraph(const IGraph &G, std::set<Register> &Set) {
+IGraph inducedSubgraph(const IGraph &G,
+                       const std::unordered_set<Register> &Set) {
   IGraph Subgraph;
   for (auto V : Set) {
-    Subgraph.insert(std::make_pair(V, std::set<Register>()));
+    Subgraph.insert(std::make_pair(V, std::unordered_set<Register>()));
     for (auto U : G.at(V)) {
       if (Set.find(U) != Set.end()) {
         Subgraph[V].insert(U);
@@ -97,22 +147,11 @@ IGraph llvm::inducedSubgraph(const IGraph &G, std::set<Register> &Set) {
   return Subgraph;
 }
 
-IGraph llvm::operator-(const IGraph &G, const std::set<Register> &S) {
-  IGraph H = G;
-  for (auto N : S) {
-    H.erase(N);
-    for (auto &[_, Neighbors] : H) {
-      Neighbors.erase(N);
-    }
-  }
-  return H;
-}
-
 /// Builds a partition tree from a set of atoms. The tree will be
 /// a right-associative binary tree.
 PartitionTree partitionTreeFromAtoms(
     std::vector<IGraph> &&Atoms,
-    const std::vector<std::set<Register>> &CliqueSeparators) {
+    const std::vector<std::unordered_set<Register>> &CliqueSeparators) {
   assert(Atoms.size() == CliqueSeparators.size());
   PartitionTree T;
   PartitionTree *Last = &T;
@@ -129,25 +168,213 @@ PartitionTree partitionTreeFromAtoms(
   }
   return T;
 }
+} // namespace
+
+namespace llvm {
+IGraph operator-(const IGraph &G, const std::unordered_set<Register> &S) {
+  IGraph H = G;
+  for (auto N : S) {
+    H.erase(N);
+    for (auto &[_, Neighbors] : H) {
+      Neighbors.erase(N);
+    }
+  }
+  return H;
+}
+} // namespace llvm
+
+using LiveInVars =
+    std::unordered_map<const MachineBasicBlock *, std::unordered_set<Register>>;
+
+/// Get the live-in variables for each basic block in the function
+LiveInVars liveIns(const MachineFunction &MF, const LiveIntervals &LIS) {
+  LiveInVars LiveIns;
+  std::queue<const MachineBasicBlock *> Q;
+  Q.push(&*MF.begin());
+  while (!Q.empty()) {
+    auto *MBB = Q.front();
+    Q.pop();
+    std::unordered_set<const MachineBasicBlock *> SuccChanged;
+    for (auto &I : *MBB) {
+      for (auto &Def : I.defs()) {
+        if (LIS.isLiveOutOfMBB(LIS.getInterval(Def.getReg()), MBB)) {
+          for (const auto *Succ : MBB->successors()) {
+            if (LiveIns[Succ].find(Def.getReg()) == LiveIns[Succ].end()) {
+              LiveIns[Succ].insert(Def.getReg());
+              SuccChanged.insert(Succ);
+            }
+          }
+        }
+      }
+    }
+    for (auto &LiveIn : LiveIns[MBB]) {
+      if (LIS.isLiveOutOfMBB(LIS.getInterval(LiveIn), MBB)) {
+        for (const auto *Succ : MBB->successors()) {
+          if (LiveIns[Succ].find(LiveIn) == LiveIns[Succ].end()) {
+            LiveIns[Succ].insert(LiveIn);
+            SuccChanged.insert(Succ);
+          }
+        }
+      }
+    }
+    for (auto *Succ : SuccChanged) {
+      Q.push(Succ);
+    }
+  }
+  return LiveIns;
+}
+
+/// Returns true if `Clique` is a clique separator of the basic block with
+/// pre-intervals `Pre`, post-intervals `Post`, and clique `Clique`.
+bool isCliqueSeparator(const std::set<LiveInterval> &Pre,
+                       const std::set<LiveInterval> &Clique,
+                       const std::set<LiveInterval> &Post) {
+  if (Pre.empty() || Post.empty()) {
+    return false;
+  }
+  std::set<LiveInterval> NonOverlappingPost, NonOverlappingPre;
+  for (auto &C : Clique) {
+    bool IsInPre = true;
+    for (auto &P : Pre) {
+      if (C.overlaps(P)) {
+        IsInPre = false;
+        break;
+      }
+    }
+    if (IsInPre) {
+      NonOverlappingPre.insert(C);
+    }
+    bool IsInPost = true;
+    for (auto &P : Post) {
+      if (C.overlaps(P)) {
+        IsInPost = false;
+        break;
+      }
+    }
+    if (IsInPost) {
+      NonOverlappingPost.insert(C);
+    }
+  }
+  // NonOverlappingPre and NonOverlappingPost are not subsets of eachother
+  // Then we can partition Clique into sets CliquePre which contains elements of
+  // NonOverlappingPost that are not in NonOverlappingPre, CliquePost which
+  // contains elements of NonOverlappingPre that are not in NonOverlappingPost,
+  // and CliqueMiddle which contains the rest of the elements
+  return std::any_of(NonOverlappingPre.begin(), NonOverlappingPre.end(),
+                     [&NonOverlappingPost](const LiveInterval &C) {
+                       return NonOverlappingPost.find(C) ==
+                              NonOverlappingPost.end();
+                     }) &&
+         std::any_of(NonOverlappingPost.begin(), NonOverlappingPost.end(),
+                     [&NonOverlappingPre](const LiveInterval &C) {
+                       return NonOverlappingPre.find(C) ==
+                              NonOverlappingPre.end();
+                     });
+}
+
+/// Gets a clique separator of a basic block
+std::optional<std::set<LiveInterval>> bbSeparator(const MachineBasicBlock *MBB,
+                                                  LiveIntervals &LIS,
+                                                  const LiveInVars &LiveIns) {
+  std::set<LiveInterval> Pre, Post, Clique;
+  for (auto LI : LiveIns.at(MBB)) {
+    Pre.insert(LIS.getInterval(LI));
+  }
+  for (auto It = MBB->instr_begin(); It != MBB->instr_end(); ++It) {
+    const auto &I = *It;
+    for (auto &Def : I.defs()) {
+
+      // remove the current interval from the post set and add to the clique
+      Clique.insert(LIS.getInterval(Def.getReg()));
+      Post.erase(LIS.getInterval(Def.getReg()));
+
+      // for all intervals that haven't started yet and overlap with the current
+      // interval, add to the post set
+      auto It2 = It;
+      for (++It2; It2 != MBB->instr_end(); ++It2) {
+        for (auto &D2 : It2->defs()) {
+          if (LIS.getInterval(D2.getReg())
+                  .overlaps(LIS.getInterval(Def.getReg()))) {
+            Post.insert(LIS.getInterval(D2.getReg()));
+          }
+        }
+      }
+    }
+
+    // for all intervals ending at the current program point,
+    // remove from clique and add to pre
+    const auto CurPoint = LIS.getSlotIndexes()->getInstructionIndex(I);
+    std::unordered_set<const LiveInterval *> ToRemove;
+    for (auto &C : Clique) {
+      // has a subrange that ends at the current program point
+      bool IsEnding = false;
+      // has a subrange that continues past the current program point
+      bool DoesContinue = false;
+      for (auto &Sr : C.subranges()) {
+        if (Sr.endIndex() == CurPoint) {
+          IsEnding = true;
+        } else if (Sr.endIndex() > CurPoint) {
+          DoesContinue = true;
+        }
+      }
+      if (IsEnding && !DoesContinue) {
+        Pre.insert(C);
+        ToRemove.insert(&C);
+      }
+    }
+    for (const auto *C : ToRemove) {
+      Clique.erase(*C);
+    }
+    ToRemove.clear();
+
+    // for all spans that no longer overlap a member of the clique,
+    // remove it from the Pre set
+    for (auto &P : Pre) {
+      bool CanRemove = true;
+      for (auto &C : Clique) {
+        if (P.overlaps(C)) {
+          CanRemove = false;
+          break;
+        }
+      }
+      if (CanRemove) {
+        ToRemove.insert(&P);
+      }
+    }
+    for (const auto *P : ToRemove) {
+      Pre.erase(*P);
+    }
+
+    if (isCliqueSeparator(Pre, Clique, Post)) {
+      return Clique;
+    }
+  }
+  return {};
+}
 
 PartitionTree llvm::buildPartitionTree(const IGraph &G,
                                        const TargetRegisterInfo *TRI) {
   auto GPrime = G;
   LLVM_DEBUG(dbgs() << "***** Elimination Order: *****\n");
-  auto PEO = perfectElimOrder(G);
+  auto [PEO, SeparatorGenerators] = perfectElimOrder(G);
   for (auto &R : PEO) {
     LLVM_DEBUG(dbgs() << printReg(R, TRI) << ", ");
   }
   LLVM_DEBUG(dbgs() << "\n");
-  std::map<Register, size_t> Indices;
+  std::unordered_map<Register, size_t> Indices;
   for (size_t Idx = 0; Idx < PEO.size(); ++Idx) {
     Indices.insert(std::make_pair(PEO[Idx], Idx));
   }
   std::vector<IGraph> Atoms;
-  std::vector<std::set<Register>> CliqueSeparators;
+  std::vector<std::unordered_set<Register>> CliqueSeparators;
   for (unsigned Idx = 0; Idx < PEO.size(); ++Idx) {
     auto &V = PEO[Idx];
-    std::set<Register> Clique;
+    // if (SeparatorGenerators.find(V) == SeparatorGenerators.end()) {
+    //   continue;
+    // ?
+    // }
+    // neighbors of V st vertices appear after V in the elimination order
+    std::unordered_set<Register> Clique;
     for (auto U : G.at(V)) {
       if (Indices[U] > Idx) {
         Clique.insert(U);
@@ -170,8 +397,73 @@ PartitionTree llvm::buildPartitionTree(const IGraph &G,
   }
   if (!GPrime.empty()) {
     Atoms.emplace_back(GPrime);
-    CliqueSeparators.emplace_back(std::set<Register>());
+    CliqueSeparators.emplace_back(std::unordered_set<Register>());
   }
+  return partitionTreeFromAtoms(std::move(Atoms), CliqueSeparators);
+}
+
+// an attempt at the approach from the chordal graph minimal separator paper
+PartitionTree buildPartitionTree(const IGraph &G,
+                                 const TargetRegisterInfo *TRI) {
+  // requires G is a chordal graph
+  std::vector<std::pair<Register, int>> Heap;
+  std::unordered_map<Register, int> Weights;
+  // numbered vertices
+  std::unordered_set<Register> VNum;
+  for (auto [V, _] : G) {
+    Heap.push_back(std::make_pair(V, 0));
+    Weights.insert(std::make_pair(V, 0));
+  }
+  // the weight of the last vertex in the order
+  std::optional<int> LastWeight;
+  // set of maximal cliques
+  std::vector<IGraph> Atoms;
+  // set of minimal separators
+  std::vector<std::unordered_set<Register>> CliqueSeparators;
+  // the previous register taken from the heap
+  std::optional<Register> LastReg;
+  std::stack<std::pair<Register, int>> DebugStack;
+  while (!Heap.empty()) {
+    std::pop_heap(Heap.begin(), Heap.end());
+    const auto [V, W] = Heap.back();
+    Heap.pop_back();
+    if (VNum.find(V) != VNum.end()) {
+      continue;
+    }
+    VNum.insert(V);
+    DebugStack.push(std::make_pair(V, W));
+    // we are inserting vertices in decreading elimination order
+    if (LastWeight && W <= *LastWeight) {
+      // V is a min separator generator and the next vertex is a maximal
+      // clique generator
+      CliqueSeparators.emplace_back(neighbors(G, VNum, V));
+      // bc we have a peo, LatReg and its neighbors that are in VNum form a
+      // clique. LastReg is the vertex in the elimination ordering AFTER V.
+      // Ie. if V = x_i then LastReg is x_{i+1}
+      Atoms.emplace_back(
+          inducedSubgraph(G, neighbors(G, VNum, *LastReg, true)));
+    }
+    LastReg = V;
+    LastWeight = W;
+    for (auto N : G.at(V)) {
+      if (VNum.find(N) != VNum.end()) {
+        continue;
+      }
+      Weights[N] += 1;
+      Heap.push_back(std::make_pair(N, Weights[N]));
+      std::push_heap(Heap.begin(), Heap.end());
+    }
+  }
+  CliqueSeparators.emplace_back();
+  Atoms.emplace_back(inducedSubgraph(G, neighbors(G, VNum, *LastReg, true)));
+  DebugStack.push(std::make_pair(*LastReg, *LastWeight));
+  LLVM_DEBUG(
+      dbgs() << "***** Elimination Order: *****\n"; while (
+                                                        !DebugStack.empty()) {
+        auto P = DebugStack.top();
+        DebugStack.pop();
+        dbgs() << "(" << printReg(P.first, TRI) << ", " << P.second << "), ";
+      } dbgs() << "\n");
   return partitionTreeFromAtoms(std::move(Atoms), CliqueSeparators);
 }
 
@@ -234,9 +526,10 @@ void llvm::debugPartitionTree(const PartitionTree &T,
     if (Node->Left && Node->Right) {
       assert(Node->Regs.empty());
       Out << "\"{";
+      unsigned Cnt = 0;
       for (auto N : Node->SeparatingClique) {
         Out << printReg(N, TRI);
-        if (N != *Node->SeparatingClique.rbegin()) {
+        if (++Cnt < Node->SeparatingClique.size()) {
           Out << ", ";
         }
       }
@@ -280,8 +573,8 @@ llvm::PRegMap::PRegMap(const IGraph &G, const VirtRegMap &VRM,
       }
     }
     OrderMap[VReg] = CorrectedOrder;
-    SetMap[VReg] =
-        std::set<MCRegister>(CorrectedOrder.begin(), CorrectedOrder.end());
+    SetMap[VReg] = std::unordered_set<MCRegister>(CorrectedOrder.begin(),
+                                                  CorrectedOrder.end());
   }
 }
 
@@ -321,7 +614,7 @@ Color *llvm::Color::getRootMut() {
       Value);
 }
 
-void llvm::Color::addMembers(const std::set<Register> &Members) {
+void llvm::Color::addMembers(const std::unordered_set<Register> &Members) {
   auto *Root = getRootMut();
   auto &Class = std::get<ColorClass>(Root->Value);
   Class.Members.insert(Members.begin(), Members.end());
