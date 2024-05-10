@@ -1,12 +1,11 @@
 #pragma once
+#include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/CodeGen/Register.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/MC/MCRegister.h"
 #include <map>
 #include <memory>
-#include <queue>
-#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -42,6 +41,12 @@ struct PartitionTree {
 /// be correct (probably?), just not optimal.
 PartitionTree buildPartitionTree(const IGraph &G,
                                  const TargetRegisterInfo *TRI);
+
+/// Builds a partition tree for the given machine function.
+std::unique_ptr<PartitionTree>
+getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
+              const MachinePostDominatorTree &PDT,
+              const TargetRegisterInfo *TRI, const IGraph &G);
 
 /// Writes the interference to a file if one is supplied
 void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI,

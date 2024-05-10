@@ -16,7 +16,6 @@
 #include "LiveDebugVariables.h"
 #include "RegAllocBase.h"
 #include "RegisterCoalescer.h"
-#include "llvm/ADT/DirectedGraph.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveInterval.h"
@@ -44,16 +43,10 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
-#include <fstream>
-#include <future>
-#include <initializer_list>
-#include <limits>
-#include <numeric>
 #include <queue>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
-#include <variant>
 
 using namespace llvm;
 
@@ -75,6 +68,11 @@ static cl::opt<std::string>
                cl::desc("Specify a comma separated list of "
                         "functions to save debug output for"),
                cl::value_desc("function1,function2,..."));
+
+static cl::opt<std::string>
+    DebugOld("debug-old-partitions",
+             cl::desc("Specify file to write old partition tree to"),
+             cl::value_desc("filename"));
 namespace {
 struct CompSpillWeight {
   bool operator()(const LiveInterval *A, const LiveInterval *B) const {
@@ -438,6 +436,8 @@ void RAParallel::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addPreserved<VirtRegMap>();
   AU.addRequired<LiveRegMatrix>();
   AU.addPreserved<LiveRegMatrix>();
+  AU.addRequired<MachinePostDominatorTree>();
+  AU.addPreserved<MachinePostDominatorTree>();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
@@ -916,18 +916,26 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
                              OutputInterferenceGraph.getValue());
     }
   });
-  const auto T = buildPartitionTree(G, TRI);
+  const auto &PDT = getAnalysis<MachinePostDominatorTree>();
+  // const auto T = buildPartitionTree(G, TRI);
+  const auto T = getPartitions(Mf, *LIS, PDT, TRI, G);
   LLVM_DEBUG(if (canDebug(Mf.getName())) {
     if (OutputPartitionTree.hasArgStr()) {
-      debugPartitionTree(T, TRI, demangle(MF->getName()),
+      debugPartitionTree(*T, TRI, demangle(MF->getName()),
                          OutputPartitionTree.getValue());
+    }
+  });
+  LLVM_DEBUG(if (canDebug(Mf.getName())) {
+    if (DebugOld.hasArgStr()) {
+      const auto T2 = buildPartitionTree(G, TRI);
+      debugPartitionTree(T2, TRI, demangle(MF->getName()), DebugOld.getValue());
     }
   });
   ColoringResult Coloring;
 #pragma omp parallel default(shared)
   {
 #pragma omp single
-    Coloring = colorPhysRegsTree(&T, PregMap);
+    Coloring = colorPhysRegsTree(&*T, PregMap);
   }
   setupAllocation(Coloring);
   allocatePhysRegs();
