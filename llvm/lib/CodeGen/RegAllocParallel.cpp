@@ -254,10 +254,12 @@ class RAParallel : public MachineFunctionPass,
                               ColoringResult &&Result) const;
 
   /// Upon recoloring `OldColor` to `NewColor` from the right subgraph,
-  /// search through the right subgraph and recolor any aliases of `OldColor`
-  /// to match the corresponding alias of `NewColor`.
+  /// search through the right subgraph and attempt to recolor any aliases of
+  /// `OldColor` to match the corresponding alias of `NewColor`. If aliases
+  /// cannot be recolored to the same color as `NewColor`, they will be
+  /// ignored.
   void recolorAliases(ColoringResult &Right, MCRegister OldColor,
-                      Color &NewColor, MergeCtx &Ctx) const;
+                      Color &NewColor, MergeCtx &Ctx, const PRegMap &M) const;
 
   // do nothing and use the coloring to seed the live regs
   void seedLiveRegs() override {}
@@ -676,7 +678,8 @@ ColoringResult RAParallel::localColor(const IGraph &G, const PRegMap &M) const {
 }
 
 void RAParallel::recolorAliases(ColoringResult &Right, MCRegister OldColor,
-                                Color &NewColor, MergeCtx &Ctx) const {
+                                Color &NewColor, MergeCtx &Ctx,
+                                const PRegMap &M) const {
   for (auto [Reg, Color] : Right.RegToColor) {
     if (Color != nullptr && !Color->members().empty() &&
         Ctx.shouldRecolor(Color)) {
@@ -686,8 +689,7 @@ void RAParallel::recolorAliases(ColoringResult &Right, MCRegister OldColor,
         std::optional<MCRegister> NewSizedPReg;
         {
           // find corresponding alias of the new color
-          auto Candidates =
-              AllocationOrder::create(Reg, *VRM, RegClassInfo, Matrix);
+          auto &Candidates = M.getAllocationOrder(Reg);
           auto NewPReg = NewColor.getPReg();
           for (auto NewPRegChoice : Candidates) {
             if (TRI->regsOverlap(NewPReg, NewPRegChoice)) {
@@ -696,19 +698,29 @@ void RAParallel::recolorAliases(ColoringResult &Right, MCRegister OldColor,
             }
           }
         }
-        assert(NewSizedPReg.has_value());
-        auto NewSizedColor = Ctx.chooseColor(NewSizedPReg.value(), Reg);
-        Ctx.setRecolored(Color);
-        LLVM_DEBUG(dbgs() << "Changing (via alias of "
-                          << printReg(NewColor.getPReg(), TRI)
-                          << "): " << printReg(Color->getPReg(), TRI) << " { ";
-                   for (auto &M
-                        : Color->members()) {
-                     dbgs() << printReg(M, TRI) << " ";
-                   } dbgs()
-                   << "} to " << printReg(NewSizedColor->getPReg(), TRI)
-                   << "\n";);
-        Color->setColor(NewSizedColor);
+        if (NewSizedPReg.has_value()) {
+          auto NewSizedColor = Ctx.chooseColor(NewSizedPReg.value(), Reg);
+          Ctx.setRecolored(Color);
+          LLVM_DEBUG(dbgs() << "Changing (via alias of "
+                            << printReg(NewColor.getPReg(), TRI) << "): "
+                            << printReg(Color->getPReg(), TRI) << " { ";
+                     for (auto &M
+                          : Color->members()) {
+                       dbgs() << printReg(M, TRI) << " ";
+                     } dbgs()
+                     << "} to " << printReg(NewSizedColor->getPReg(), TRI)
+                     << "\n";);
+          Color->setColor(NewSizedColor);
+        } else {
+          // NOTE: I think this breaks the proof that we don't need to spill
+          // during merging. We could check aliases when we initially color a
+          // color class, but I think this is fine, at least for the tests we
+          // currently have.
+          LLVM_DEBUG(dbgs()
+                         << "Ignoring alias recolor of " << printReg(Reg, TRI)
+                         << " to " << printReg(ColorPReg, TRI)
+                         << " because no available color\n";);
+        }
       }
     }
   }
@@ -733,7 +745,7 @@ ColoringResult RAParallel::recolorRight(MergeCtx &Ctx, const PRegMap &M,
                         << printReg(NewColor->getPReg(), TRI) << "\n";);
       auto OldPReg = NodeColor->getPReg();
       NodeColor->setColor(NewColor);
-      recolorAliases(Right, OldPReg, *NewColor, Ctx);
+      recolorAliases(Right, OldPReg, *NewColor, Ctx, M);
     }
   }
   for (auto &[Reg, Color] : Right.RegToColor) {
@@ -764,7 +776,7 @@ ColoringResult RAParallel::recolorRight(MergeCtx &Ctx, const PRegMap &M,
           << "} to " << printReg(NewColor->getPReg(), TRI) << "\n";);
       auto OldPReg = Color->getPReg();
       Color->setColor(NewColor);
-      recolorAliases(Right, OldPReg, *Color, Ctx);
+      recolorAliases(Right, OldPReg, *Color, Ctx, M);
       Ctx.setColorUsed(*NewColor, TRI);
     }
   }
@@ -813,7 +825,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
                    dbgs() << printReg(M, TRI) << " ";
                  } dbgs()
                  << "}\n";);
-      recolorAliases(Right, OldRColor, *RColor, Ctx);
+      recolorAliases(Right, OldRColor, *RColor, Ctx, M);
     } else if (LColor != nullptr) {
       // Node is spilled in right subgraph but colored in the left
 

@@ -43,6 +43,7 @@ PartitionTree buildPartitionTree(const IGraph &G,
                                  const TargetRegisterInfo *TRI);
 
 /// Builds a partition tree for the given machine function.
+/// The partition tree is built to be relatively balanced.
 std::unique_ptr<PartitionTree>
 getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
               const MachinePostDominatorTree &PDT,
