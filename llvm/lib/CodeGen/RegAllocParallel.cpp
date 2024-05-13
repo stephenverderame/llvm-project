@@ -810,15 +810,13 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
   for (auto Node : Clique) {
     const auto LColor = Left.RegToColor.at(Node);
     auto RColor = Right.RegToColor.at(Node);
-    if (!Ctx.shouldRecolor(RColor)) {
-      // with the way we merge cliques in the new method, we might not actually
-      // have a clique separator anymore, so it could be the case that a node
-      // is part of a color class that we already colored.
-      continue;
-    }
     if (LColor != nullptr && RColor != nullptr) {
-      // two nodes in the clique cannot have the same color
-      assert(Ctx.shouldRecolor(RColor));
+      if (!Ctx.shouldRecolor(RColor)) {
+        // with the way we merge cliques in the new method, we might not
+        // actually have a clique separator anymore, so it could be the case
+        // that a node is part of a color class that we already colored.
+        continue;
+      }
       // replace rcolor by lcolor in right subgraph
       auto OldRColor = RColor->getPReg();
       Ctx.setRecolored(*RColor);
@@ -843,7 +841,10 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
       LLVM_DEBUG(dbgs() << "Spilling " << printReg(Node, TRI)
                         << " from left\n";);
     } else if (RColor != nullptr) {
-      assert(Ctx.shouldRecolor(RColor));
+      if (!Ctx.shouldRecolor(RColor)) {
+        // see earlier comment
+        continue;
+      }
       // Node is spilled in left subgraph, but colored in the right
       Right.RegToColor.at(Node)->members().erase(Node);
       Right.RegToColor[Node] = nullptr;

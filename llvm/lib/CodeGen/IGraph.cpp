@@ -394,6 +394,7 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
              const TargetRegisterInfo *TRI, const IGraph &G) {
   std::vector<CodeSeparator> Separators;
   std::set<std::reference_wrapper<const LiveInterval>> Pre, Post, Clique;
+  std::set<const MachineInstr *> DebugPartitionInstrs;
   const auto FirstDefs = firstVRegDef(MBB);
   if (FirstDefs.empty()) {
     return Separators;
@@ -484,13 +485,20 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
 
     if (!Partition.empty() && isCliqueSeparator(Pre, Clique, Post)) {
       Separators.emplace_back(MBB, Clique, Partition, TRI);
+      LLVM_DEBUG(dbgs() << "BB Partition: "; for (auto *I
+                                                  : DebugPartitionInstrs) {
+        dbgs() << "\t" << *I << "\n";
+      } dbgs() << "\t"
+               << I << "\n\n";);
       Partition.clear();
+      DebugPartitionInstrs.clear();
     } else {
       for (auto &Def : I.defs()) {
         if (Def.isReg() && Def.getReg().isVirtual()) {
           Partition.insert(LIS.getInterval(Def.getReg()));
         }
       }
+      DebugPartitionInstrs.insert(&I);
     }
   }
   return Separators;
