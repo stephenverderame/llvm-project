@@ -290,8 +290,14 @@ bool isCliqueSeparator(
 
 class CodeSeparator {
 public:
+  /// The clique separating the code before and after the separator. The clique
+  /// should be part of both partitions, however, not all the live intervals in
+  /// the clique may actually be in the `Partition` of the adjacent clique
+  /// separators. TODO: do we want to just construct the CodeSeparator in such a
+  /// way that the clique is always a subset of the partition?
   std::set<std::reference_wrapper<const LiveInterval>> Clique;
-  /// Set of live intervals that exist since the last separator
+  /// Set of live intervals that exist since the last separator.
+  /// Some of these may be in `Clique` or the clique of the next separator.
   std::set<std::reference_wrapper<const LiveInterval>> Partition;
 
 private:
@@ -575,6 +581,8 @@ getSeparatorsAlongPath(
         for (size_t SepIdx = MinPathSeps; SepIdx < Path.size(); ++SepIdx) {
           Partition.insert(Path[SepIdx].Partition.begin(),
                            Path[SepIdx].Partition.end());
+          Partition.insert(Path[SepIdx].Clique.begin(),
+                           Path[SepIdx].Clique.end());
         }
       }
       for (auto &P : PathPartitions) {
