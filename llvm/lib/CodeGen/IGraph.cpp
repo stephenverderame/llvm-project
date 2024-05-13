@@ -368,15 +368,16 @@ inline bool interferes(const IGraph &G, const LiveInterval &A,
 }
 
 /// Gets the first virtual register that is defined in the basic block
-std::optional<Register> firstVRegDef(const MachineBasicBlock *MBB) {
+std::vector<Register> firstVRegDef(const MachineBasicBlock *MBB) {
+  std::vector<Register> Defs;
   for (auto &I : *MBB) {
     for (auto &Def : I.defs()) {
       if (Def.isReg() && Def.getReg().isVirtual()) {
-        return Def.getReg();
+        Defs.push_back(Def.getReg());
       }
     }
   }
-  return {};
+  return Defs;
 }
 
 /// Gets a clique separator of a basic block
@@ -393,14 +394,15 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
              const TargetRegisterInfo *TRI, const IGraph &G) {
   std::vector<CodeSeparator> Separators;
   std::set<std::reference_wrapper<const LiveInterval>> Pre, Post, Clique;
-  const auto FirstDef = firstVRegDef(MBB);
-  if (!FirstDef.has_value()) {
+  const auto FirstDefs = firstVRegDef(MBB);
+  if (!FirstDefs.empty()) {
     return Separators;
   }
   // insert live-ins into the clique or the pre set, depending on if their
   // live range ends at the first definition or not
   for (auto LI : LiveIns.at(MBB)) {
-    if (interferes(G, LI, FirstDef.value())) {
+    if (std::any_of(FirstDefs.begin(), FirstDefs.end(),
+                    [&](const auto &V) { return interferes(G, LI, V); })) {
       Clique.insert(LIS.getInterval(LI));
     } else {
       Pre.insert(LIS.getInterval(LI));
@@ -428,6 +430,8 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
           }
         }
       }
+      // TODO: the above loop is probably redundant, and I think we can just do
+      // this
       for (auto N : G.at(Def.getReg())) {
         if (Partition.find(LIS.getInterval(N)) == Partition.end() &&
             Pre.find(LIS.getInterval(N)) == Pre.end() &&

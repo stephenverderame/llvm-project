@@ -1,13 +1,11 @@
-//===-- RegAllocBasic.cpp - Basic Register Allocator ----------------------===//
+//===-- RegAllocParallel.cpp - Parallel Register Allocator ----------------===//
 //
-// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines the RAParallel function pass, which provides a minimal
-// implementation of the basic register allocator.
+// This file defines the RAParallel function pass, which provides a parallel
+// implementation of the RABasic register allocator.
 //
 //===----------------------------------------------------------------------===//
 
@@ -797,6 +795,8 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
   auto &Result = Left;
   MergeCtx Ctx;
   for (auto &[VReg, Color] : Right.RegToColor) {
+    // TODO: we could probably do this worklist style and only recolor something
+    // if we create a conflict
     if (Color != nullptr) {
       Ctx.addColorToChange(Color);
     }
@@ -810,6 +810,12 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
   for (auto Node : Clique) {
     const auto LColor = Left.RegToColor.at(Node);
     auto RColor = Right.RegToColor.at(Node);
+    if (!Ctx.shouldRecolor(RColor)) {
+      // with the way we merge cliques in the new method, we might not actually
+      // have a clique separator anymore, so it could be the case that a node
+      // is part of a color class that we already colored.
+      continue;
+    }
     if (LColor != nullptr && RColor != nullptr) {
       // two nodes in the clique cannot have the same color
       assert(Ctx.shouldRecolor(RColor));
@@ -858,6 +864,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
                                                     : Ctx.getColorsToChange()) {
     dbgs() << printReg(PReg, TRI) << " ";
   } dbgs() << "]\n");
+  // TODO: if we create no conflicts then we don't need to recolor anything
   auto Res = recolorRight(Ctx, M, Right, std::move(Result));
   LLVM_DEBUG(Res.print(dbgs() << "====\n", TRI) << "\n\n");
   return Res;
