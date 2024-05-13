@@ -395,7 +395,7 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
   std::vector<CodeSeparator> Separators;
   std::set<std::reference_wrapper<const LiveInterval>> Pre, Post, Clique;
   const auto FirstDefs = firstVRegDef(MBB);
-  if (!FirstDefs.empty()) {
+  if (FirstDefs.empty()) {
     return Separators;
   }
   // insert live-ins into the clique or the pre set, depending on if their
