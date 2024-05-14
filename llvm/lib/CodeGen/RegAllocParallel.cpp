@@ -918,9 +918,10 @@ RAParallel::getAvailableColor(Register VReg, const PRegMap &M,
 
 bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
   LLVM_DEBUG(dbgs() << "********** Parallel REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << Mf.getName() << '\n');
+                    << "********** Function: " << Mf.getName() << '\n';);
 
   MF = &Mf;
+  LLVM_DEBUG(Mf.print(dbgs()); dbgs() << "\n\n\n";);
   RegAllocBase::init(getAnalysis<VirtRegMap>(), getAnalysis<LiveIntervals>(),
                      getAnalysis<LiveRegMatrix>());
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, getAnalysis<MachineLoopInfo>(),
