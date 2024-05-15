@@ -7,6 +7,7 @@
 #include "llvm/IR/Function.h"
 #include <functional>
 #include <queue>
+#include <unordered_map>
 #define DEBUG_TYPE "regalloc"
 #include "AllocationOrder.h"
 #include "IGraph.hpp"
@@ -31,6 +32,7 @@ bool operator<(const std::reference_wrapper<const LiveInterval> &A,
 } // namespace std
 
 namespace {
+template <typename T> using CRef = std::reference_wrapper<const T>;
 /// Computes a perfect elimination order for the interference graph `G`.
 /// @return a pair of the perfect elimination order and the set of vertices
 /// that are separator generators.
@@ -193,13 +195,12 @@ IGraph operator-(const IGraph &G, const std::unordered_set<Register> &S) {
 } // namespace llvm
 
 namespace {
-/// The variables defined before a basic block
-using DefinedVars =
+using LiveInVars =
     std::unordered_map<const MachineBasicBlock *, std::unordered_set<Register>>;
 
-/// Get the variables that may reach each basic block in the function
-DefinedVars definedVars(const MachineFunction &MF, const LiveIntervals &LIS) {
-  DefinedVars DefinedVars;
+/// Get the live-in variables for each basic block in the function
+LiveInVars liveIns(const MachineFunction &MF, const LiveIntervals &LIS) {
+  LiveInVars LiveIns;
   std::queue<const MachineBasicBlock *> Q;
   for (auto &BB : MF) {
     Q.push(&BB);
@@ -211,22 +212,21 @@ DefinedVars definedVars(const MachineFunction &MF, const LiveIntervals &LIS) {
     for (auto &I : *MBB) {
       for (auto &Def : I.defs()) {
         if (Def.isReg() && Def.getReg().isVirtual() /*&&
-            LIS.isLiveOutOfMBB(LIS.getInterval(Def.getReg()), MBB)*/) {
+            LIS.isLiveOutOfMBB(LIS.getInterval(Def.getReg()), MBB) */) {
           for (const auto *Succ : MBB->successors()) {
-            if (DefinedVars[Succ].find(Def.getReg()) ==
-                DefinedVars[Succ].end()) {
-              DefinedVars[Succ].insert(Def.getReg());
+            if (LiveIns[Succ].find(Def.getReg()) == LiveIns[Succ].end()) {
+              LiveIns[Succ].insert(Def.getReg());
               SuccChanged.insert(Succ);
             }
           }
         }
       }
     }
-    for (auto &LiveIn : DefinedVars[MBB]) {
+    for (auto &LiveIn : LiveIns[MBB]) {
       // if (LIS.isLiveOutOfMBB(LIS.getInterval(LiveIn), MBB)) {
       for (const auto *Succ : MBB->successors()) {
-        if (DefinedVars[Succ].find(LiveIn) == DefinedVars[Succ].end()) {
-          DefinedVars[Succ].insert(LiveIn);
+        if (LiveIns[Succ].find(LiveIn) == LiveIns[Succ].end()) {
+          LiveIns[Succ].insert(LiveIn);
           SuccChanged.insert(Succ);
         }
       }
@@ -236,21 +236,19 @@ DefinedVars definedVars(const MachineFunction &MF, const LiveIntervals &LIS) {
       Q.push(Succ);
     }
   }
-  return DefinedVars;
+  return LiveIns;
 }
 
 /// Returns true if `Clique` is a clique separator of the basic block with
 /// pre-intervals `Pre`, post-intervals `Post`, and clique `Clique`.
-bool isCliqueSeparator(
-    const std::set<std::reference_wrapper<const LiveInterval>> &Pre,
-    const std::set<std::reference_wrapper<const LiveInterval>> &Clique,
-    const std::set<std::reference_wrapper<const LiveInterval>> &Post) {
+bool isCliqueSeparator(const std::set<CRef<LiveInterval>> &Pre,
+                       const std::set<CRef<LiveInterval>> &Clique,
+                       const std::set<CRef<LiveInterval>> &Post) {
   // TODO: constrain the clique separators so that we do not choose too many
   if (Pre.empty() || Post.empty()) {
     return false;
   }
-  std::set<std::reference_wrapper<const LiveInterval>> NonOverlappingPost,
-      NonOverlappingPre;
+  std::set<CRef<LiveInterval>> NonOverlappingPost, NonOverlappingPre;
   for (auto &C : Clique) {
     bool IsInPre = true;
     for (auto &P : Pre) {
@@ -293,9 +291,8 @@ bool isCliqueSeparator(
 
 /// Returns `true` if `Partition` is a non-trivial partition that we should
 /// use in the decomposition of the interference graph.
-bool isValidPartition(
-    const std::set<std::reference_wrapper<const LiveInterval>> &Partition,
-    const std::set<std::reference_wrapper<const LiveInterval>> &Clique) {
+bool isValidPartition(const std::set<CRef<LiveInterval>> &Partition,
+                      const std::set<CRef<LiveInterval>> &Clique) {
   // partition should contain some element that is not present in the clique
   return !Partition.empty() &&
          std::any_of(Partition.begin(), Partition.end(),
@@ -311,10 +308,10 @@ public:
   /// the clique may actually be in the `Partition` of the adjacent clique
   /// separators. TODO: do we want to just construct the CodeSeparator in such a
   /// way that the clique is always a subset of the partition?
-  std::set<std::reference_wrapper<const LiveInterval>> Clique;
+  std::set<CRef<LiveInterval>> Clique;
   /// Set of live intervals that exist since the last separator.
   /// Some of these may be in `Clique` or the clique of the next separator.
-  std::set<std::reference_wrapper<const LiveInterval>> Partition;
+  std::set<CRef<LiveInterval>> Partition;
 
 private:
   // map from basic block to the start and end slot indexes of the clique
@@ -322,11 +319,10 @@ private:
       SlotMap;
 
 public:
-  CodeSeparator(
-      const MachineBasicBlock *MBB,
-      const std::set<std::reference_wrapper<const LiveInterval>> &Clique,
-      const std::set<std::reference_wrapper<const LiveInterval>> &Partition,
-      const TargetRegisterInfo *TRI)
+  CodeSeparator(const MachineBasicBlock *MBB,
+                const std::set<CRef<LiveInterval>> &Clique,
+                const std::set<CRef<LiveInterval>> &Partition,
+                const TargetRegisterInfo *TRI)
       : Clique(Clique), Partition(Partition) {
     bool Init = false;
     assert(!this->Clique.empty());
@@ -372,17 +368,6 @@ public:
   }
 };
 
-/// Returns true if `A` and `B` interfere in the interference graph `G`.
-inline bool interferes(const IGraph &G, const Register &A, const Register &B) {
-  return G.at(A).find(B) != G.at(A).end();
-}
-
-/// Returns true if `A` and `B` interfere in the interference graph `G`.
-inline bool interferes(const IGraph &G, const LiveInterval &A,
-                       const LiveInterval &B) {
-  return interferes(G, A.reg(), B.reg());
-}
-
 /// Gets the first virtual register that is defined in the basic block
 std::vector<Register> firstVRegDef(const MachineBasicBlock *MBB) {
   std::vector<Register> Defs;
@@ -392,6 +377,9 @@ std::vector<Register> firstVRegDef(const MachineBasicBlock *MBB) {
         Defs.push_back(Def.getReg());
       }
     }
+    if (!Defs.empty()) {
+      break;
+    }
   }
   return Defs;
 }
@@ -399,30 +387,43 @@ std::vector<Register> firstVRegDef(const MachineBasicBlock *MBB) {
 /// Gets a clique separator of a basic block
 /// @param MBB the basic block to get the separator of
 /// @param LIS the live intervals of the function
-/// @param LiveIns the live-in variables of the function
 /// @param Partition In: the set of live intervals since the last separator.
 /// Out: the set of live intervals since the last separator along this path.
 /// @return the clique separators of the basic block
-std::vector<CodeSeparator>
-bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
-             const DefinedVars &LiveIns,
-             std::set<std::reference_wrapper<const LiveInterval>> &Partition,
-             const TargetRegisterInfo *TRI, const IGraph &G) {
+std::vector<CodeSeparator> bbSeparators(const MachineBasicBlock *MBB,
+                                        const LiveIntervals &LIS,
+                                        const LiveInVars &LiveIns,
+                                        std::set<CRef<LiveInterval>> &Partition,
+                                        const TargetRegisterInfo *TRI) {
   std::vector<CodeSeparator> Separators;
-  std::set<std::reference_wrapper<const LiveInterval>> Pre, Post, Clique;
+  std::set<CRef<LiveInterval>> Pre, Post, Clique;
   std::set<const MachineInstr *> DebugPartitionInstrs;
   const auto FirstDefs = firstVRegDef(MBB);
   if (FirstDefs.empty()) {
     return Separators;
   }
-  // insert live-ins into the clique or the pre set, depending on if their
-  // live range ends at the first definition or not
-  for (auto LI : LiveIns.at(MBB)) {
-    if (std::any_of(FirstDefs.begin(), FirstDefs.end(),
-                    [&](const auto &V) { return interferes(G, LI, V); })) {
-      Clique.insert(LIS.getInterval(LI));
+  // everything in the block starts in the post set
+  for (auto &I : *MBB) {
+    for (auto &Def : I.defs()) {
+      if (!Def.isReg() || !Def.getReg().isVirtual()) {
+        continue;
+      }
+      Post.insert(LIS.getInterval(Def.getReg()));
+    }
+  }
+  // everything since the last separator is in the pre set or clique
+  auto S = LiveIns.at(MBB);
+  for (auto &P : Partition) {
+    S.insert(P.get().reg());
+  }
+  for (auto &P : S) {
+    const auto &Interval = LIS.getInterval(P);
+    if (std::any_of(FirstDefs.begin(), FirstDefs.end(), [&](Register R) {
+          return LIS.getInterval(R).overlaps(Interval);
+        })) {
+      Clique.insert(Interval);
     } else {
-      Pre.insert(LIS.getInterval(LI));
+      Pre.insert(Interval);
     }
   }
   for (auto It = MBB->instr_begin(); It != MBB->instr_end(); ++It) {
@@ -438,13 +439,7 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
 
       // for all intervals that haven't started yet and overlap with the current
       // interval, add to the post set
-      for (auto N : G.at(Def.getReg())) {
-        if (Partition.find(LIS.getInterval(N)) == Partition.end() &&
-            Pre.find(LIS.getInterval(N)) == Pre.end() &&
-            Clique.find(LIS.getInterval(N)) == Clique.end()) {
-          Post.insert(LIS.getInterval(N));
-        }
-      }
+      // this is already done by starting with all defs in the block in the post
     }
 
     // for all intervals ending at the current program point,
@@ -455,7 +450,8 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
       for (auto &D : I.defs()) {
         if (D.isReg() && D.getReg().isVirtual() &&
             (C.get().reg() == D.getReg() ||
-             interferes(G, C.get().reg(), D.getReg()))) {
+             C.get().overlaps(LIS.getInterval(D.getReg())) ||
+             LIS.isLiveOutOfMBB(C.get(), MBB))) {
           IsEnding = false;
           break;
         }
@@ -475,7 +471,7 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
     for (auto &P : Pre) {
       bool CanRemove = true;
       for (auto &C : Clique) {
-        if (interferes(G, C.get(), P.get())) {
+        if (C.get().overlaps(P.get())) {
           CanRemove = false;
           break;
         }
@@ -497,16 +493,52 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
     if (isValidPartition(Partition, Clique) &&
         isCliqueSeparator(Pre, Clique, Post)) {
       Separators.emplace_back(MBB, Clique, Partition, TRI);
-      LLVM_DEBUG(dbgs() << "BB Partition: "; for (auto *I
-                                                  : DebugPartitionInstrs) {
-        dbgs() << "\t" << *I << "\n";
+      LLVM_DEBUG(dbgs() << "BB Partition:\n"; for (auto *I
+                                                   : DebugPartitionInstrs) {
+        dbgs() << "\t" << *I;
       } dbgs() << "\t"
-               << I << "\n\n";
+               << I << "\n";
                  DebugPartitionInstrs.clear());
       Partition.clear();
     }
   }
+  LLVM_DEBUG(dbgs() << "Leftover: (" << Separators.size() << ")\n";
+             for (auto *I
+                  : DebugPartitionInstrs) { dbgs() << "\t" << *I; });
   return Separators;
+}
+
+/// Sort of a hack to deal with the fact that we're actually not in SSA. For
+/// any partition that contains a register that is included in another
+/// partition, we make sure that all cliques in between contain the register.
+void fixSeparators(std::vector<CodeSeparator> &Seps,
+                   const std::set<CRef<LiveInterval>> &LastPartition) {
+  std::unordered_map<const LiveInterval *, unsigned> Ends;
+  std::unordered_map<const LiveInterval *, unsigned> Starts;
+  for (auto &P : LastPartition) {
+    Ends[&P.get()] = Seps.size();
+  }
+  for (int SepIdx = Seps.size() - 1; SepIdx >= 0; --SepIdx) {
+    for (auto &P : Seps[SepIdx].Partition) {
+      if (Ends.find(&P.get()) == Ends.end()) {
+        Ends[&P.get()] = SepIdx;
+      } else {
+        Starts[&P.get()] = SepIdx;
+      }
+    }
+    for (auto &C : Seps[SepIdx].Clique) {
+      if (Ends.find(&C.get()) == Ends.end()) {
+        Ends[&C.get()] = SepIdx;
+      } else {
+        Starts[&C.get()] = SepIdx;
+      }
+    }
+  }
+  for (auto &[Reg, Start] : Starts) {
+    for (auto I = Start; I < Ends[Reg]; ++I) {
+      Seps[I].Clique.insert(*Reg);
+    }
+  }
 }
 
 /// Gets a list of separators, in sequential order, along all paths from `Start`
@@ -517,20 +549,18 @@ bbSeparators(const MachineBasicBlock *MBB, const LiveIntervals &LIS,
 /// @param End the end of the path (exclusive) or nullptr if the path ends at
 /// the end of the function
 /// @param LIS the live intervals of the function
-/// @param LiveIns the live-in variables of the function
 /// @param PDT the post-dominator tree of the function
 /// @param Visited the set of basic blocks that have already been visited in
 /// some path
 /// @param Partition the set of live intervals since the last separator
-std::pair<std::vector<CodeSeparator>,
-          std::set<std::reference_wrapper<const LiveInterval>>>
-getSeparatorsAlongPath(
-    const MachineBasicBlock *Start, const MachineBasicBlock *End,
-    const LiveIntervals &LIS, const DefinedVars &LiveIns,
-    const MachinePostDominatorTree &PDT,
-    std::unordered_set<const MachineBasicBlock *> Visited,
-    std::set<std::reference_wrapper<const LiveInterval>> Partition,
-    const TargetRegisterInfo *TRI, const IGraph &G) {
+std::pair<std::vector<CodeSeparator>, std::set<CRef<LiveInterval>>>
+getSeparatorsAlongPath(const MachineBasicBlock *Start,
+                       const MachineBasicBlock *End, const LiveIntervals &LIS,
+                       const MachinePostDominatorTree &PDT,
+                       std::unordered_set<const MachineBasicBlock *> &Visited,
+                       std::set<CRef<LiveInterval>> Partition,
+                       const TargetRegisterInfo *TRI,
+                       const LiveInVars &LiveIn) {
   // TODO: clean this up
   std::vector<CodeSeparator> Separators;
   std::queue<const MachineBasicBlock *> Q;
@@ -542,7 +572,7 @@ getSeparatorsAlongPath(
       assert(Q.empty());
       break;
     }
-    const auto BlockSeps = bbSeparators(MBB, LIS, LiveIns, Partition, TRI, G);
+    const auto BlockSeps = bbSeparators(MBB, LIS, LiveIn, Partition, TRI);
     Separators.insert(Separators.end(), BlockSeps.begin(), BlockSeps.end());
     Visited.insert(MBB);
     if (MBB->succ_empty()) {
@@ -559,13 +589,11 @@ getSeparatorsAlongPath(
       // vector of pathsep[pathidx][sepidx]
       std::vector<std::vector<CodeSeparator>> PathSeps;
       // vector of the values since the last separator for each path
-      std::vector<std::set<std::reference_wrapper<const LiveInterval>>>
-          PathPartitions;
+      std::vector<std::set<CRef<LiveInterval>>> PathPartitions;
       auto MinPathSeps = std::numeric_limits<size_t>::max();
       for (auto *Succ : MBB->successors()) {
-        // SSA, so there can't be a live interval that "wraps" around via a loop
         auto [Seps, Part] = getSeparatorsAlongPath(
-            Succ, NextBlock, LIS, LiveIns, PDT, Visited, Partition, TRI, G);
+            Succ, NextBlock, LIS, PDT, Visited, Partition, TRI, LiveIn);
         if (Seps.size() < MinPathSeps) {
           MinPathSeps = Seps.size();
         }
@@ -580,8 +608,8 @@ getSeparatorsAlongPath(
         for (size_t PathIdx = 1; PathIdx < PathSeps.size(); ++PathIdx) {
           Sep.merge(PathSeps[PathIdx][SepIdx]);
           LLVM_DEBUG(
-              dbgs() << "Meging [ "; for (auto &C
-                                          : PathSeps[PathIdx][SepIdx].Clique) {
+              dbgs() << "Merging [ "; for (auto &C
+                                           : PathSeps[PathIdx][SepIdx].Clique) {
                 dbgs() << printReg(C.get().reg(), TRI) << ", ";
               } dbgs() << "] into [ ";
               for (auto &C
@@ -616,14 +644,13 @@ getSeparatorsAlongPath(
       // so we could create more partitions instead of aligning them
 
       std::array<
-          std::pair<std::vector<CodeSeparator>,
-                    std::set<std::reference_wrapper<const LiveInterval>>>,
+          std::pair<std::vector<CodeSeparator>, std::set<CRef<LiveInterval>>>,
           2>
           PathSeps;
       int Idx = 0;
       for (auto *Succ : MBB->successors()) {
         PathSeps[Idx++] = getSeparatorsAlongPath(
-            Succ, nullptr, LIS, LiveIns, PDT, Visited, Partition, TRI, G);
+            Succ, nullptr, LIS, PDT, Visited, Partition, TRI, LiveIn);
       }
       Partition.clear();
       const auto NumSharedSeps =
@@ -634,8 +661,8 @@ getSeparatorsAlongPath(
       for (size_t SepIdx = 0; SepIdx < NumSharedSeps; ++SepIdx) {
         auto &Sep = PathSeps[0].first[SepIdx];
         LLVM_DEBUG(
-            dbgs() << "Meging [ "; for (auto &C
-                                        : PathSeps[1].first[SepIdx].Clique) {
+            dbgs() << "Merging [ "; for (auto &C
+                                         : PathSeps[1].first[SepIdx].Clique) {
               dbgs() << printReg(C.get().reg(), TRI) << ", ";
             } dbgs() << "] into [ ";
             for (auto &C
@@ -683,11 +710,10 @@ getSeparatorsAlongPath(
 /// @param Start the start index of the list of separators, inclusive
 /// @param End the end index of the list of separators, exclusive
 /// @return the node of the partition tree
-std::unique_ptr<PartitionTree> buildNode(
-    const std::set<std::reference_wrapper<const LiveInterval>> &LastPart,
-    const std::set<std::reference_wrapper<const LiveInterval>> &PrevClique,
-    const IGraph &G, const std::vector<CodeSeparator> &Seps, size_t Start,
-    size_t End) {
+std::unique_ptr<PartitionTree>
+buildNode(const std::set<CRef<LiveInterval>> &LastPart,
+          const std::set<CRef<LiveInterval>> &PrevClique, const IGraph &G,
+          const std::vector<CodeSeparator> &Seps, size_t Start, size_t End) {
   // [Start, End) for the list of separators
   // [Start, End] for the list of nodes
   if (Start == End) {
@@ -734,9 +760,11 @@ std::unique_ptr<PartitionTree>
 llvm::getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
                     const MachinePostDominatorTree &PDT,
                     const TargetRegisterInfo *TRI, const IGraph &G) {
-  const auto LiveIns = definedVars(MF, LIS);
+  std::unordered_set<const MachineBasicBlock *> Visited;
+  const auto LiveIn = liveIns(MF, LIS);
   auto [Seps, LastPartition] = getSeparatorsAlongPath(
-      MF.getBlockNumbered(0), nullptr, LIS, LiveIns, PDT, {}, {}, TRI, G);
+      MF.getBlockNumbered(0), nullptr, LIS, PDT, Visited, {}, TRI, LiveIn);
+  fixSeparators(Seps, LastPartition);
   LLVM_DEBUG(dbgs() << "***** Separators: *****\n");
   LLVM_DEBUG(
       for (auto &S

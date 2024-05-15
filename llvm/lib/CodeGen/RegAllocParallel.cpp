@@ -947,7 +947,7 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
     }
   });
   LLVM_DEBUG(if (canDebug(Mf.getName())) {
-    if (DebugOld.hasArgStr()) {
+    if (DebugOld.hasArgStr() && DebugOld.find(".") != std::string::npos) {
       const auto T2 = buildPartitionTree(G, TRI);
       debugPartitionTree(T2, TRI, demangle(MF->getName()), DebugOld.getValue());
     }
