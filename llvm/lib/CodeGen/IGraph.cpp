@@ -764,7 +764,7 @@ llvm::getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
   const auto LiveIn = liveIns(MF, LIS);
   auto [Seps, LastPartition] = getSeparatorsAlongPath(
       MF.getBlockNumbered(0), nullptr, LIS, PDT, Visited, {}, TRI, LiveIn);
-  fixSeparators(Seps, LastPartition);
+  // fixSeparators(Seps, LastPartition);
   LLVM_DEBUG(dbgs() << "***** Separators: *****\n");
   LLVM_DEBUG(
       for (auto &S
