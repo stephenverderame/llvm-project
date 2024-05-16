@@ -47,7 +47,7 @@ PartitionTree buildPartitionTree(const IGraph &G,
 std::unique_ptr<PartitionTree>
 getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
               const MachinePostDominatorTree &PDT,
-              const TargetRegisterInfo *TRI, const IGraph &G);
+              const TargetRegisterInfo *TRI);
 
 /// Writes the interference to a file if one is supplied
 void debugInterferenceGraph(const IGraph &G, const TargetRegisterInfo *TRI,
@@ -71,7 +71,7 @@ public:
   /// registers that could potentially be assigned to it, taking into
   /// account precolored register interference. The order of the physical
   /// registers is the order in which they are preferred.
-  PRegMap(const IGraph &G, const VirtRegMap &VRM,
+  PRegMap(const MachineFunction &MF, const VirtRegMap &VRM,
           const RegisterClassInfo &RegClassInfo, LiveRegMatrix *Matrix,
           const LiveIntervals *LIS);
 

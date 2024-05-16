@@ -2,6 +2,7 @@
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/IR/Function.h"
@@ -699,6 +700,56 @@ getSeparatorsAlongPath(const MachineBasicBlock *Start,
   return {Separators, Partition};
 }
 
+/// Build an interference graph from the regsiter live intervals
+IGraph makeInterferenceGraph(const LiveIntervals &LIS,
+                             const MachineFunction &MF,
+                             const std::unordered_set<Register> &Regs) {
+  IGraph G;
+  auto &MRI = MF.getRegInfo();
+  for (auto Reg : Regs) {
+    if (MRI.reg_nodbg_empty(Reg)) {
+      continue;
+    }
+    for (auto Reg2 : Regs) {
+      if (MRI.reg_nodbg_empty(Reg2)) {
+        continue;
+      }
+      if (Reg == Reg2) {
+        if (G.find(Reg) == G.end()) {
+          G.insert(std::make_pair(Reg, std::unordered_set<Register>()));
+        }
+        continue;
+      }
+      if (LIS.getInterval(Reg).overlaps(LIS.getInterval(Reg2))) {
+        if (G.find(Reg) == G.end()) {
+          G.insert(std::make_pair(Reg, std::unordered_set<Register>()));
+        }
+        if (G.find(Reg2) == G.end()) {
+          G.insert(std::make_pair(Reg2, std::unordered_set<Register>()));
+        }
+        if (LIS.getInterval(Reg).hasSubRanges() &&
+            LIS.getInterval(Reg2).hasSubRanges()) {
+          for (auto &Range1 : LIS.getInterval(Reg).subranges()) {
+            for (auto &Range2 : LIS.getInterval(Reg2).subranges()) {
+              if (Range1.overlaps(Range2)) {
+                G[Reg].insert(Reg2);
+                G[Reg2].insert(Reg);
+                goto dbl_break;
+              }
+            }
+          }
+        dbl_break:
+          (void)G;
+        } else {
+          G[Reg].insert(Reg2);
+          G[Reg2].insert(Reg);
+        }
+      }
+    }
+  }
+  return G;
+}
+
 /// Builds a node of the partition tree by recursively building the left and
 /// right children by splitting the list of separators in half.
 /// @param LastPart the set of live intervals that are in the last partition
@@ -712,7 +763,8 @@ getSeparatorsAlongPath(const MachineBasicBlock *Start,
 /// @return the node of the partition tree
 std::unique_ptr<PartitionTree>
 buildNode(const std::set<CRef<LiveInterval>> &LastPart,
-          const std::set<CRef<LiveInterval>> &PrevClique, const IGraph &G,
+          const std::set<CRef<LiveInterval>> &PrevClique,
+          const LiveIntervals &LIS, const MachineFunction &MF,
           const std::vector<CodeSeparator> &Seps, size_t Start, size_t End) {
   // [Start, End) for the list of separators
   // [Start, End] for the list of nodes
@@ -739,7 +791,7 @@ buildNode(const std::set<CRef<LiveInterval>> &LastPart,
         S.insert(P.get().reg());
       }
     }
-    Node->Regs = inducedSubgraph(G, S);
+    Node->Regs = makeInterferenceGraph(LIS, MF, S);
     return Node;
   }
   assert(Start < End);
@@ -749,8 +801,8 @@ buildNode(const std::set<CRef<LiveInterval>> &LastPart,
     Node->SeparatingClique.insert(C.get().reg());
   }
   Node->Left =
-      buildNode(Seps[Mdpt].Partition, PrevClique, G, Seps, Start, Mdpt);
-  Node->Right = buildNode(LastPart, Seps[Mdpt].Clique, G, Seps,
+      buildNode(Seps[Mdpt].Partition, PrevClique, LIS, MF, Seps, Start, Mdpt);
+  Node->Right = buildNode(LastPart, Seps[Mdpt].Clique, LIS, MF, Seps,
                           std::min(Mdpt + 1, End), End);
   return Node;
 }
@@ -759,7 +811,7 @@ buildNode(const std::set<CRef<LiveInterval>> &LastPart,
 std::unique_ptr<PartitionTree>
 llvm::getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
                     const MachinePostDominatorTree &PDT,
-                    const TargetRegisterInfo *TRI, const IGraph &G) {
+                    const TargetRegisterInfo *TRI) {
   std::unordered_set<const MachineBasicBlock *> Visited;
   const auto LiveIn = liveIns(MF, LIS);
   auto [Seps, LastPartition] = getSeparatorsAlongPath(
@@ -786,7 +838,7 @@ llvm::getPartitions(const MachineFunction &MF, const LiveIntervals &LIS,
         dbgs() << printReg(C.get().reg(), TRI) << ", ";
       } dbgs()
       << "}\n\n";);
-  return buildNode(LastPartition, {}, G, Seps, 0, Seps.size());
+  return buildNode(LastPartition, {}, LIS, MF, Seps, 0, Seps.size());
 }
 
 PartitionTree llvm::buildPartitionTree(const IGraph &G,
@@ -1010,10 +1062,15 @@ void llvm::debugPartitionTree(const PartitionTree &T,
   OutFile << OutTxt << std::endl;
 }
 
-llvm::PRegMap::PRegMap(const IGraph &G, const VirtRegMap &VRM,
+llvm::PRegMap::PRegMap(const MachineFunction &MF, const VirtRegMap &VRM,
                        const RegisterClassInfo &RegClassInfo,
                        LiveRegMatrix *Matrix, const LiveIntervals *LIS) {
-  for (auto &[VReg, _] : G) {
+  auto &MRI = MF.getRegInfo();
+  for (unsigned Idx = 0; Idx < MRI.getNumVirtRegs(); ++Idx) {
+    Register VReg = Register::index2VirtReg(Idx);
+    if (MRI.reg_nodbg_empty(VReg)) {
+      continue;
+    }
     auto Order = AllocationOrder::create(VReg, VRM, RegClassInfo, Matrix);
     std::vector<MCRegister> CorrectedOrder;
     for (auto PReg : Order) {

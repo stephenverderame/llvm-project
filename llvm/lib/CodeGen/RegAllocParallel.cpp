@@ -248,8 +248,8 @@ class RAParallel : public MachineFunctionPass,
   /// @return The new coloring result with the right subgraph colored and added
   /// to the existing coloring result.
   ColoringResult recolorRight(MergeCtx &Ctx, const PRegMap &M,
-                              ColoringResult &Right,
-                              ColoringResult &&Result) const;
+                              ColoringResult &Right, ColoringResult &&Result,
+                              bool ShouldRecolorRight) const;
 
   /// Upon recoloring `OldColor` to `NewColor` from the right subgraph,
   /// search through the right subgraph and attempt to recolor any aliases of
@@ -726,7 +726,8 @@ void RAParallel::recolorAliases(ColoringResult &Right, MCRegister OldColor,
 
 ColoringResult RAParallel::recolorRight(MergeCtx &Ctx, const PRegMap &M,
                                         ColoringResult &Right,
-                                        ColoringResult &&Result) const {
+                                        ColoringResult &&Result,
+                                        bool ShouldRecolorRight) const {
   // for nodes in the clique that need colors in the right subgraph
   for (auto &NodeColor : Ctx.NeedColors) {
     // node is spilled in the left subgraph but not the right subgraph
@@ -754,28 +755,32 @@ ColoringResult RAParallel::recolorRight(MergeCtx &Ctx, const PRegMap &M,
       Result.RegToColor.insert(std::make_pair(Reg, Color));
     }
   }
-  for (auto &[_, Color] : Right.RegToColor) {
-    if (Color == nullptr) {
-      continue;
-    }
-    if (Ctx.shouldRecolor(Color)) {
-      Ctx.setRecolored(Color);
-      if (Color->members().empty()) {
-        LLVM_DEBUG(dbgs() << "Color " << printReg(Color->getPReg(), TRI)
-                          << " has no members\n";);
+  if (ShouldRecolorRight) {
+    for (auto &[_, Color] : Right.RegToColor) {
+      if (Color == nullptr) {
         continue;
       }
-      auto Mem = *Color->members().begin();
-      auto NewColor = getAvailableColor(Mem, M, Color, Ctx);
-      LLVM_DEBUG(
-          dbgs() << "Changing: " << printReg(Color->getPReg(), TRI) << " { ";
-          for (auto &M
-               : Color->members()) { dbgs() << printReg(M, TRI) << " "; } dbgs()
-          << "} to " << printReg(NewColor->getPReg(), TRI) << "\n";);
-      auto OldPReg = Color->getPReg();
-      Color->setColor(NewColor);
-      recolorAliases(Right, OldPReg, *Color, Ctx, M);
-      Ctx.setColorUsed(*NewColor, TRI);
+      if (Ctx.shouldRecolor(Color)) {
+        Ctx.setRecolored(Color);
+        if (Color->members().empty()) {
+          LLVM_DEBUG(dbgs() << "Color " << printReg(Color->getPReg(), TRI)
+                            << " has no members\n";);
+          continue;
+        }
+        auto Mem = *Color->members().begin();
+        auto NewColor = getAvailableColor(Mem, M, Color, Ctx);
+        LLVM_DEBUG(dbgs() << "Changing: " << printReg(Color->getPReg(), TRI)
+                          << " { ";
+                   for (auto &M
+                        : Color->members()) {
+                     dbgs() << printReg(M, TRI) << " ";
+                   } dbgs()
+                   << "} to " << printReg(NewColor->getPReg(), TRI) << "\n";);
+        auto OldPReg = Color->getPReg();
+        Color->setColor(NewColor);
+        recolorAliases(Right, OldPReg, *Color, Ctx, M);
+        Ctx.setColorUsed(*NewColor, TRI);
+      }
     }
   }
   return Result;
@@ -807,6 +812,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
           std::make_pair(LColor->getPReg(), Color::getRootPtr(LColor)));
     }
   }
+  bool ShouldRecolorRight = false;
   for (auto Node : Clique) {
     const auto LColor = Left.RegToColor.at(Node);
     auto RColor = Right.RegToColor.at(Node);
@@ -829,7 +835,10 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
                    dbgs() << printReg(M, TRI) << " ";
                  } dbgs()
                  << "}\n";);
-      recolorAliases(Right, OldRColor, *RColor, Ctx, M);
+      if (OldRColor != LColor->getPReg()) {
+        ShouldRecolorRight = true;
+        recolorAliases(Right, OldRColor, *RColor, Ctx, M);
+      }
     } else if (LColor != nullptr) {
       // Node is spilled in right subgraph but colored in the left
 
@@ -855,6 +864,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
         // if there are other nodes in the right subgraph with the same color,
         // we need to recolor them
         Ctx.NeedColors.insert(Color::getRootPtr(RColor));
+        ShouldRecolorRight = true;
       } else {
         // no other reg has this color, so it's free to use
         Ctx.setRecolored(RColor);
@@ -866,7 +876,7 @@ RAParallel::mergeResults(ColoringResult &&Left, ColoringResult &&Right,
     dbgs() << printReg(PReg, TRI) << " ";
   } dbgs() << "]\n");
   // TODO: if we create no conflicts then we don't need to recolor anything
-  auto Res = recolorRight(Ctx, M, Right, std::move(Result));
+  auto Res = recolorRight(Ctx, M, Right, std::move(Result), ShouldRecolorRight);
   LLVM_DEBUG(Res.print(dbgs() << "====\n", TRI) << "\n\n");
   return Res;
 }
@@ -929,17 +939,19 @@ bool RAParallel::runOnMachineFunction(MachineFunction &Mf) {
   VRAI.calculateSpillWeightsAndHints();
 
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, VRAI));
-  const auto G = computeInterference();
-  const auto PregMap = PRegMap{G, *VRM, RegClassInfo, Matrix, LIS};
+  const auto PregMap = PRegMap{*MF, *VRM, RegClassInfo, Matrix, LIS};
+  IGraph G;
   LLVM_DEBUG(if (canDebug(Mf.getName())) {
-    if (OutputInterferenceGraph.hasArgStr()) {
+    if (OutputInterferenceGraph.hasArgStr() &&
+        OutputInterferenceGraph.find('.') != std::string::npos) {
+      G = computeInterference();
       debugInterferenceGraph(G, TRI, demangle(MF->getName()),
                              OutputInterferenceGraph.getValue());
     }
   });
   const auto &PDT = getAnalysis<MachinePostDominatorTree>();
   // const auto T = buildPartitionTree(G, TRI);
-  const auto T = getPartitions(Mf, *LIS, PDT, TRI, G);
+  const auto T = getPartitions(Mf, *LIS, PDT, TRI);
   LLVM_DEBUG(if (canDebug(Mf.getName())) {
     if (OutputPartitionTree.hasArgStr()) {
       debugPartitionTree(*T, TRI, demangle(MF->getName()),
