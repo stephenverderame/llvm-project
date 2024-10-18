@@ -1619,30 +1619,38 @@ void CodeGenFunction::GenerateCode(GlobalDecl GD, llvm::Function *Fn,
 /// this statement is not executed normally, it not containing a label means
 /// that we can just remove the code.
 bool CodeGenFunction::ContainsLabel(const Stmt *S, bool IgnoreCaseStmts) {
-  // Null statement, not a label!
-  if (!S) return false;
+  // Recursion stack
+  llvm::SmallVector<std::pair<const Stmt *, bool>, 4> Stack;
+  Stack.emplace_back(S, IgnoreCaseStmts);
 
-  // If this is a label, we have to emit the code, consider something like:
-  // if (0) {  ...  foo:  bar(); }  goto foo;
-  //
-  // TODO: If anyone cared, we could track __label__'s, since we know that you
-  // can't jump to one from outside their declared region.
-  if (isa<LabelStmt>(S))
-    return true;
+  while (!Stack.empty()) {
+    auto [CurStmt, CurIgnoreCaseStmts] = Stack.pop_back_val();
 
-  // If this is a case/default statement, and we haven't seen a switch, we have
-  // to emit the code.
-  if (isa<SwitchCase>(S) && !IgnoreCaseStmts)
-    return true;
+    // Null statement, not a label!
+    if (!CurStmt)
+      continue;
 
-  // If this is a switch statement, we want to ignore cases below it.
-  if (isa<SwitchStmt>(S))
-    IgnoreCaseStmts = true;
-
-  // Scan subexpressions for verboten labels.
-  for (const Stmt *SubStmt : S->children())
-    if (ContainsLabel(SubStmt, IgnoreCaseStmts))
+    // If this is a label, we have to emit the code, consider something like:
+    // if (0) {  ...  foo:  bar(); }  goto foo;
+    //
+    // TODO: If anyone cared, we could track __label__'s, since we know that you
+    // can't jump to one from outside their declared region.
+    if (isa<LabelStmt>(CurStmt))
       return true;
+
+    // If this is a case/default statement, and we haven't seen a switch, we
+    // have to emit the code.
+    if (isa<SwitchCase>(CurStmt) && !CurIgnoreCaseStmts)
+      return true;
+
+    // If this is a switch statement, we want to ignore cases below it.
+    if (isa<SwitchStmt>(CurStmt))
+      CurIgnoreCaseStmts = true;
+
+    // Scan subexpressions for verboten labels.
+    for (const Stmt *SubStmt : CurStmt->children())
+      Stack.emplace_back(SubStmt, CurIgnoreCaseStmts);
+  }
 
   return false;
 }
