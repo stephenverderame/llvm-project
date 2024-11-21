@@ -269,6 +269,9 @@ def err_drv_cannot_read_config_file : Error<
   "cannot read configuration file '%0': %1">;
 def err_drv_arg_requires_bitcode_input: Error<
   "option '%0' requires input to be LLVM bitcode">;
+def err_drv_non_regular_multiple_reads: Error<
+  "this compilation requires multiple jobs, but "
+  "non-regular input '%0' cannot be read more than once">;
 
 def err_target_unsupported_arch
   : Error<"the target architecture '%0' is not supported by the target '%1'">;

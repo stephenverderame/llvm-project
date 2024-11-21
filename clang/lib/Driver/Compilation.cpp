@@ -239,15 +239,61 @@ static bool InputsOk(const Command &C,
   return !ActionFailed(&C.getSource(), FailingCommands);
 }
 
+/// Returns `true` if `Filename` is not a regular file, symlink, or directory.
+/// If this condition is true, and `NumJobsReadsOther > 0`, then this also adds
+/// a diagnostic to `D`.
+static bool checkForOtherFile(const Driver &D, const char *Filename,
+                              int NumJobsReadsOther) {
+  bool IsOtherFile = false;
+  if (strcmp(Filename, "-") == 0)
+    IsOtherFile = true;
+  else {
+    llvm::sys::fs::file_status OtherStat;
+    llvm::sys::fs::status(Filename, OtherStat);
+    IsOtherFile = llvm::sys::fs::is_other(OtherStat);
+  }
+  if (IsOtherFile && NumJobsReadsOther > 0)
+    D.Diag(diag::err_drv_non_regular_multiple_reads) << Filename;
+  return IsOtherFile;
+}
+
+/// Returns `true` if `A` contains a file which is not a regular file, symlink,
+/// or directory and if so, adds a diagnostic to `D` for each such file if
+/// `NumJobsReadsOther` is also `> 0`
+static bool checkForOtherFile(const Driver &D, const llvm::opt::Arg &A,
+                              int NumJobsReadsOther) {
+  bool IsOtherFile = false;
+  for (auto *V : A.getValues())
+    IsOtherFile |= checkForOtherFile(D, V, NumJobsReadsOther);
+  return IsOtherFile;
+}
+
 void Compilation::ExecuteJobs(const JobList &Jobs,
                               FailingCommandList &FailingCommands,
                               bool LogOnly) const {
+  int NumJobsReadsOther = 0;
   // According to UNIX standard, driver need to continue compiling all the
   // inputs on the command line even one of them failed.
   // In all but CLMode, execute all the jobs unless the necessary inputs for the
   // job is missing due to previous failures.
   for (const auto &Job : Jobs) {
-    if (!InputsOk(Job, FailingCommands))
+    if (NumJobsReadsOther <= 1) {
+      bool CurJobReadsOther = false;
+      for (auto &IInfo : Job.getInputInfos()) {
+        if (IInfo.isFilename())
+          CurJobReadsOther |= checkForOtherFile(
+              getDriver(), IInfo.getFilename(), NumJobsReadsOther);
+        if (IInfo.isInputArg())
+          CurJobReadsOther |= checkForOtherFile(
+              getDriver(), IInfo.getInputArg(), NumJobsReadsOther);
+      }
+      if (CurJobReadsOther) {
+        if (NumJobsReadsOther++ > 0) {
+          FailingCommands.emplace_back(1, &Job);
+        }
+      }
+    }
+    if (!InputsOk(Job, FailingCommands) || NumJobsReadsOther > 1)
       continue;
     const Command *FailingCommand = nullptr;
     if (int Res = ExecuteCommand(Job, FailingCommand, LogOnly)) {
