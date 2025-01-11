@@ -847,15 +847,17 @@ StmtResult Parser::ParseCaseStatement(ParsedStmtContext StmtCtx,
 
   // TopLevelCase - This is the highest level we have parsed.  'case 1' in the
   // example above.
-  StmtResult TopLevelCase(true);
+  // StmtResult TopLevelCase(true);
+  StmtVector Cases;
 
   // DeepestParsedCaseStmt - This is the deepest statement we have parsed, which
   // gets updated each time a new case is parsed, and whose body is unset so
   // far.  When parsing 'case 4', this is the 'case 3' node.
-  Stmt *DeepestParsedCaseStmt = nullptr;
+  // Stmt *DeepestParsedCaseStmt = nullptr;
 
   // While we have case statements, eat and stack them.
   SourceLocation ColonLoc;
+  StmtResult NullStmt(true);
   do {
     SourceLocation CaseLoc = MissingCase ? Expr.get()->getExprLoc() :
                                            ConsumeToken();  // eat the 'case'.
@@ -929,18 +931,26 @@ StmtResult Parser::ParseCaseStatement(ParsedStmtContext StmtCtx,
     // If we had a sema error parsing this case, then just ignore it and
     // continue parsing the sub-stmt.
     if (Case.isInvalid()) {
-      if (TopLevelCase.isInvalid())  // No parsed case stmts.
+      if (Cases.empty()) // No parsed case stmts.
         return ParseStatement(/*TrailingElseLoc=*/nullptr, StmtCtx);
       // Otherwise, just don't add it as a nested case.
     } else {
       // If this is the first case statement we parsed, it becomes TopLevelCase.
       // Otherwise we link it into the current chain.
-      Stmt *NextDeepest = Case.get();
-      if (TopLevelCase.isInvalid())
-        TopLevelCase = Case;
-      else
-        Actions.ActOnCaseStmtBody(DeepestParsedCaseStmt, Case.get());
-      DeepestParsedCaseStmt = NextDeepest;
+      // Stmt *NextDeepest = Case.get();
+      // if (TopLevelCase.isInvalid())
+      //   TopLevelCase = Case;
+      // else
+      //   Actions.ActOnCaseStmtBody(DeepestParsedCaseStmt, Case.get());
+      // DeepestParsedCaseStmt = NextDeepest;
+      Cases.push_back(Case.get());
+      if (Tok.is(tok::kw_case)) {
+        if (NullStmt.isInvalid())
+          NullStmt = Actions.ActOnNullStmt(SourceLocation());
+        Actions.ActOnCaseStmtBody(Case.get(), NullStmt.get());
+      } else {
+        break;
+      }
     }
 
     // Handle all case statements.
@@ -959,16 +969,21 @@ StmtResult Parser::ParseCaseStatement(ParsedStmtContext StmtCtx,
   }
 
   // Install the body into the most deeply-nested case.
-  if (DeepestParsedCaseStmt) {
+  if (!Cases.empty()) {
     // Broken sub-stmt shouldn't prevent forming the case statement properly.
     if (SubStmt.isInvalid())
       SubStmt = Actions.ActOnNullStmt(SourceLocation());
     DiagnoseLabelFollowedByDecl(*this, SubStmt.get());
-    Actions.ActOnCaseStmtBody(DeepestParsedCaseStmt, SubStmt.get());
+    Actions.ActOnCaseStmtBody(Cases.back(), SubStmt.get());
   }
 
   // Return the top level parsed statement tree.
-  return TopLevelCase;
+  if (Cases.size() > 1)
+    return Actions.ActOnCompoundStmt(Cases.front()->getBeginLoc(),
+                                     Cases.back()->getEndLoc(), Cases, false);
+  if (!Cases.empty())
+    return Cases.back();
+  return StmtResult(true);
 }
 
 /// ParseDefaultStatement
